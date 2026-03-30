@@ -16,7 +16,8 @@ const app = express();
 app.use(helmet());
 
 // Restricted CORS — allow both Vite (5173) and CRA (3000) dev servers
-const allowedOrigins = (process.env.CLIENT_ORIGIN || 'http://localhost:5173,http://localhost:5174,http://localhost:3000').split(',');
+// const allowedOrigins = (process.env.CLIENT_ORIGIN || 'http://localhost:5173,http://localhost:5174,http://localhost:3000').split(',');
+const allowedOrigins = (process.env.CLIENT_ORIGIN ).split(',');
 app.use(cors({
     origin: (origin, callback) => {
         if (!origin || allowedOrigins.includes(origin)) return callback(null, true);
