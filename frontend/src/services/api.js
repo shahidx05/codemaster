@@ -1,7 +1,7 @@
 import axios from 'axios'
 
 // Vite env: use import.meta.env.VITE_* instead of process.env.REACT_APP_*
-const API_BASE_URL = import.meta.env.VITE_API_URL || 'http://localhost:5000/api'
+const API_BASE_URL = import.meta.env.VITE_API_URL
 
 const api = axios.create({
     baseURL: API_BASE_URL,
