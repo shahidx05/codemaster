@@ -4,8 +4,8 @@ import { problemsAPI, submissionsAPI, contestsAPI } from '../services/api'
 import CodeEditor from '../components/CodeEditor'
 import TestResults from '../components/TestResults'
 import { useAuth } from '../context/AuthContext'
-import { FiAlertTriangle } from 'react-icons/fi'
-import { FaPlay, FaAlignLeft, FaLayerGroup, FaTrophy, FaSpinner, FaChevronRight, FaArrowRight } from 'react-icons/fa'
+import { FiAlertTriangle, FiChevronDown, FiChevronUp, FiTerminal } from 'react-icons/fi'
+import { FaPlay, FaAlignLeft, FaLayerGroup, FaTrophy, FaSpinner, FaArrowRight } from 'react-icons/fa'
 
 const DIFF_STYLES = {
     Easy:   'text-emerald-400 bg-emerald-400/10 border-emerald-400/20',
@@ -17,8 +17,6 @@ const TABS = [
     { id: 'description', label: 'Description', icon: <FaAlignLeft size={12} /> },
     { id: 'results',     label: 'Results',     icon: <FaLayerGroup size={12} /> }
 ]
-
-// ── localStorage helpers for contest progress ──────────────────────────────────
 
 function getSolvedSet(contestId) {
     if (!contestId) return new Set()
@@ -35,6 +33,47 @@ function addSolved(contestId, problemId) {
     localStorage.setItem(`contest_solved_${contestId}`, JSON.stringify([...set]))
 }
 
+// ── Custom output display for run-custom results ───────────────────────────────
+
+const CustomRunResult = ({ result }) => {
+    if (!result) return null
+    const hasCompile = result.compileOutput
+    const hasStderr  = result.stderr
+    const hasStdout  = result.stdout
+
+    return (
+        <div className="flex flex-col gap-3 text-xs font-mono">
+            {hasCompile && (
+                <div className="p-3 bg-yellow-500/10 border border-yellow-500/30 rounded-lg">
+                    <div className="text-yellow-400 font-semibold mb-1 font-sans flex items-center gap-1.5">
+                        <FiTerminal size={12} /> Compilation Error
+                    </div>
+                    <pre className="text-yellow-300/80 whitespace-pre-wrap break-all">{result.compileOutput}</pre>
+                </div>
+            )}
+            {hasStderr && !hasCompile && (
+                <div className="p-3 bg-red-500/10 border border-red-500/30 rounded-lg">
+                    <div className="text-red-400 font-semibold mb-1 font-sans flex items-center gap-1.5">
+                        <FiTerminal size={12} /> Runtime Error
+                    </div>
+                    <pre className="text-red-300/80 whitespace-pre-wrap break-all">{result.stderr}</pre>
+                </div>
+            )}
+            {hasStdout && (
+                <div className="p-3 bg-[#1a1a1a] border border-[#2a2a2a] rounded-lg">
+                    <div className="text-gray-400 font-semibold mb-1 font-sans flex items-center gap-1.5">
+                        <FiTerminal size={12} /> Output
+                    </div>
+                    <pre className="text-emerald-300 whitespace-pre-wrap break-all">{result.stdout}</pre>
+                </div>
+            )}
+            {!hasCompile && !hasStderr && !hasStdout && (
+                <div className="text-gray-500 text-center py-4">No output produced.</div>
+            )}
+        </div>
+    )
+}
+
 // ── ProblemDetailPage ──────────────────────────────────────────────────────────
 
 const ProblemDetailPage = () => {
@@ -49,13 +88,16 @@ const ProblemDetailPage = () => {
     const [loading,        setLoading]        = useState(true)
     const [submitting,     setSubmitting]     = useState(false)
     const [running,        setRunning]        = useState(false)
+    const [runningCustom,  setRunningCustom]  = useState(false)
     const [testResults,    setTestResults]    = useState(null)
+    const [customResult,   setCustomResult]   = useState(null)
     const [submitStatus,   setSubmitStatus]   = useState(null)
     const [isRunResult,    setIsRunResult]    = useState(false)
     const [activeTab,      setActiveTab]      = useState('description')
     const [error,          setError]          = useState('')
+    const [stdinOpen,      setStdinOpen]      = useState(false)
+    const [customStdin,    setCustomStdin]    = useState('')
 
-    // Contest problems list (for "Next Problem" navigation)
     const [contestProblems, setContestProblems] = useState([])
 
     const fetchProblem = useCallback(async () => {
@@ -71,7 +113,6 @@ const ProblemDetailPage = () => {
 
     useEffect(() => { fetchProblem() }, [fetchProblem])
 
-    // Fetch contest problem list when inside a contest
     useEffect(() => {
         if (!contestId) return
         contestsAPI.getById(contestId)
@@ -86,15 +127,18 @@ const ProblemDetailPage = () => {
         setLanguage(lang)
         if (problem) setCode(problem.starterCode?.[lang] || '')
         setTestResults(null)
+        setCustomResult(null)
         setSubmitStatus(null)
         setIsRunResult(false)
     }
 
-    // ── Run (public test cases only, no DB save) ─────────────────────────────
+    // ── Run against public test cases ──────────────────────────────────────────
 
     const handleRun = async () => {
         if (!isAuthenticated) { setError('Please log in to run your code.'); return }
-        setRunning(true); setError(''); setTestResults(null); setSubmitStatus(null); setIsRunResult(false)
+        if (!code.trim())     { setError('Please write some code first.'); return }
+        setRunning(true); setError(''); setTestResults(null); setCustomResult(null)
+        setSubmitStatus(null); setIsRunResult(false)
         try {
             const res = await submissionsAPI.run({ problemId: id, code, language })
             const r   = res.data
@@ -107,32 +151,45 @@ const ProblemDetailPage = () => {
         } finally { setRunning(false) }
     }
 
-    // ── Submit ───────────────────────────────────────────────────────────────
+    // ── Run with custom stdin ──────────────────────────────────────────────────
+
+    const handleRunCustom = async () => {
+        if (!isAuthenticated) { setError('Please log in to run your code.'); return }
+        if (!code.trim())     { setError('Please write some code first.'); return }
+        setRunningCustom(true); setError(''); setCustomResult(null); setTestResults(null)
+        setSubmitStatus(null); setIsRunResult(false)
+        try {
+            const res = await submissionsAPI.runCustom({ code, language, stdin: customStdin })
+            setCustomResult(res.data)
+            setActiveTab('results')
+        } catch (err) {
+            setError(err.response?.data?.message || 'Error running code with custom input.')
+        } finally { setRunningCustom(false) }
+    }
+
+    // ── Submit ─────────────────────────────────────────────────────────────────
 
     const handleSubmit = async () => {
         if (!isAuthenticated) { setError('Please log in to submit.'); return }
-        setSubmitting(true); setError(''); setTestResults(null); setSubmitStatus(null); setIsRunResult(false)
+        if (!code.trim())     { setError('Please write some code first.'); return }
+        setSubmitting(true); setError(''); setTestResults(null); setCustomResult(null)
+        setSubmitStatus(null); setIsRunResult(false)
         try {
             const payload = { problemId: id, code, language }
             if (contestId) payload.contestId = contestId
-
             const res = await submissionsAPI.submit(payload)
             const sub = res.data.submission
             setTestResults(sub.testResults)
             setSubmitStatus(sub.status)
             setIsRunResult(false)
             setActiveTab('results')
-
-            // Track solved problems in localStorage for contest navigation
-            if (contestId && sub.status === 'Accepted') {
-                addSolved(contestId, id)
-            }
+            if (contestId && sub.status === 'Accepted') addSolved(contestId, id)
         } catch (err) {
             setError(err.response?.data?.message || 'Error submitting code.')
         } finally { setSubmitting(false) }
     }
 
-    // ── Next problem logic ────────────────────────────────────────────────────
+    // ── Next problem ───────────────────────────────────────────────────────────
 
     const nextProblemLink = () => {
         if (!contestId || !contestProblems.length) return null
@@ -145,8 +202,9 @@ const ProblemDetailPage = () => {
         return { to: `/contests/${contestId}`, label: 'Back to Contest →' }
     }
 
-    const nextLink = nextProblemLink()
-    const isAccepted = submitStatus === 'Accepted' && !isRunResult
+    const nextLink    = nextProblemLink()
+    const isAccepted  = submitStatus === 'Accepted' && !isRunResult
+    const isBusy      = submitting || running || runningCustom
 
     if (loading) return (
         <div className="flex items-center justify-center h-[calc(100vh-64px)] bg-[#0f0f0f]">
@@ -161,8 +219,10 @@ const ProblemDetailPage = () => {
 
     return (
         <div className="flex h-[calc(100vh-64px)] bg-[#0f0f0f] overflow-hidden">
-            {/* Left: description / results */}
+
+            {/* ── Left: description / results ── */}
             <div className="w-2/5 flex flex-col border-r border-[#2a2a2a] overflow-hidden">
+
                 {/* Title header */}
                 <div className="flex items-center justify-between px-5 py-4 border-b border-[#2a2a2a] bg-[#1a1a1a]">
                     <h1 className="text-base font-bold text-white line-clamp-1">{problem.title}</h1>
@@ -233,36 +293,49 @@ const ProblemDetailPage = () => {
                     )}
 
                     {activeTab === 'results' && (
-                        testResults ? (
-                            <div className="flex flex-col gap-4">
-                                {/* Run vs Submit label */}
-                                {isRunResult && (
+                        <div className="flex flex-col gap-4">
+                            {/* Custom run result */}
+                            {customResult && (
+                                <div className="flex flex-col gap-2">
                                     <div className="flex items-center gap-2 px-3 py-2 bg-[#1e1e1e] border border-[#2a2a2a] rounded-lg text-xs text-gray-400">
-                                        <FaPlay size={9} className="text-gray-500" />
-                                        <span>Run Result — only public test cases were checked. No submission recorded.</span>
+                                        <FiTerminal size={11} className="text-gray-500" />
+                                        <span>Custom Input Run — output shown below.</span>
                                     </div>
-                                )}
+                                    <CustomRunResult result={customResult} />
+                                </div>
+                            )}
 
-                                <TestResults results={testResults} overallStatus={submitStatus} />
+                            {/* Public test case results */}
+                            {testResults && (
+                                <div className="flex flex-col gap-2">
+                                    {isRunResult && (
+                                        <div className="flex items-center gap-2 px-3 py-2 bg-[#1e1e1e] border border-[#2a2a2a] rounded-lg text-xs text-gray-400">
+                                            <FaPlay size={9} className="text-gray-500" />
+                                            <span>Run Result — public test cases only. No submission recorded.</span>
+                                        </div>
+                                    )}
+                                    <TestResults results={testResults} overallStatus={submitStatus} />
+                                    {isAccepted && contestId && nextLink && (
+                                        <Link to={nextLink.to}
+                                            className="flex items-center justify-center gap-2 mt-2 bg-orange-500 hover:bg-orange-400 text-white text-sm font-semibold px-5 py-2.5 rounded-xl transition-colors">
+                                            {nextLink.label} <FaArrowRight size={12} />
+                                        </Link>
+                                    )}
+                                </div>
+                            )}
 
-                                {/* Next Problem button — only after a real Accepted submission inside a contest */}
-                                {isAccepted && contestId && nextLink && (
-                                    <Link
-                                        to={nextLink.to}
-                                        className="flex items-center justify-center gap-2 mt-2 bg-orange-500 hover:bg-orange-400 text-white text-sm font-semibold px-5 py-2.5 rounded-xl transition-colors">
-                                        {nextLink.label} <FaArrowRight size={12} />
-                                    </Link>
-                                )}
-                            </div>
-                        ) : (
-                            <p className="text-gray-600 text-center mt-10">Run or submit your code to see results.</p>
-                        )
+                            {!testResults && !customResult && (
+                                <p className="text-gray-600 text-center mt-10">Run or submit your code to see results.</p>
+                            )}
+                        </div>
                     )}
                 </div>
             </div>
 
-            {/* Right: editor */}
+            {/* ── Right: editor + stdin ── */}
             <div className="flex-1 flex flex-col overflow-hidden">
+
+                {/* Toolbar */}
                 <div className="flex items-center justify-between px-4 py-3 border-b border-[#2a2a2a] bg-[#1a1a1a]">
                     <select value={language} onChange={e => handleLanguageChange(e.target.value)}
                         className="text-xs font-medium text-gray-300 bg-[#2a2a2a] border border-[#3a3a3a] rounded-lg px-3 py-1.5 focus:outline-none focus:border-orange-500/50 cursor-pointer">
@@ -272,11 +345,8 @@ const ProblemDetailPage = () => {
                     </select>
 
                     <div className="flex items-center gap-2">
-                        {/* Run button — gray/secondary style */}
-                        <button
-                            id="run-code-btn"
-                            onClick={handleRun}
-                            disabled={running || submitting || !isAuthenticated}
+                        <button id="run-code-btn" onClick={handleRun}
+                            disabled={isBusy || !isAuthenticated}
                             className="flex items-center gap-1.5 bg-[#2a2a2a] hover:bg-[#333] disabled:opacity-50 disabled:cursor-not-allowed text-gray-300 hover:text-white text-xs font-semibold px-4 py-1.5 rounded-lg border border-[#3a3a3a] hover:border-[#555] transition-colors">
                             {running
                                 ? <><FaSpinner className="animate-spin" size={10} /> Running…</>
@@ -284,11 +354,8 @@ const ProblemDetailPage = () => {
                             }
                         </button>
 
-                        {/* Submit button — orange primary style */}
-                        <button
-                            id="submit-code-btn"
-                            onClick={handleSubmit}
-                            disabled={submitting || running || !isAuthenticated}
+                        <button id="submit-code-btn" onClick={handleSubmit}
+                            disabled={isBusy || !isAuthenticated}
                             className="flex items-center gap-2 bg-orange-500 hover:bg-orange-400 disabled:opacity-50 disabled:cursor-not-allowed text-white text-xs font-semibold px-4 py-1.5 rounded-lg transition-colors">
                             {submitting
                                 ? <><FaSpinner className="animate-spin" size={10} /> Submitting…</>
@@ -298,14 +365,47 @@ const ProblemDetailPage = () => {
                     </div>
                 </div>
 
+                {/* Error banner */}
                 {error && (
                     <div className="flex items-center gap-2 text-red-400 bg-red-500/10 border-b border-red-500/20 px-4 py-2 text-xs">
                         <FiAlertTriangle size={13} /> {error}
                     </div>
                 )}
 
-                <div className="flex-1">
+                {/* Editor */}
+                <div className="flex-1 min-h-0">
                     <CodeEditor code={code} onChange={setCode} language={language} />
+                </div>
+
+                {/* Custom stdin panel */}
+                <div className="border-t border-[#2a2a2a] bg-[#111]">
+                    <button onClick={() => setStdinOpen(v => !v)}
+                        className="flex items-center gap-2 w-full px-4 py-2.5 text-xs text-gray-400 hover:text-gray-200 hover:bg-[#1a1a1a] transition-colors">
+                        <FiTerminal size={12} />
+                        <span className="font-medium">Custom Input (stdin)</span>
+                        <span className="ml-auto">{stdinOpen ? <FiChevronDown size={12}/> : <FiChevronUp size={12}/>}</span>
+                    </button>
+
+                    {stdinOpen && (
+                        <div className="px-3 pb-3 flex flex-col gap-2">
+                            <textarea
+                                id="custom-stdin-input"
+                                value={customStdin}
+                                onChange={e => setCustomStdin(e.target.value)}
+                                placeholder="Enter custom input here…"
+                                rows={4}
+                                className="w-full bg-[#0a0a0a] border border-[#2a2a2a] rounded-lg px-3 py-2 text-xs text-gray-300 font-mono resize-none focus:outline-none focus:border-orange-500/40 placeholder-gray-700"
+                            />
+                            <button id="run-custom-btn" onClick={handleRunCustom}
+                                disabled={isBusy || !isAuthenticated}
+                                className="self-end flex items-center gap-1.5 bg-[#2a2a2a] hover:bg-[#333] disabled:opacity-50 disabled:cursor-not-allowed text-gray-300 hover:text-white text-xs font-semibold px-4 py-1.5 rounded-lg border border-[#3a3a3a] hover:border-[#555] transition-colors">
+                                {runningCustom
+                                    ? <><FaSpinner className="animate-spin" size={10}/> Running…</>
+                                    : <><FaPlay size={10}/> Run with Custom Input</>
+                                }
+                            </button>
+                        </div>
+                    )}
                 </div>
 
                 {!isAuthenticated && (

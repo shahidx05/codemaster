@@ -1,7 +1,7 @@
 import axios from 'axios'
 
 // Vite env: use import.meta.env.VITE_* instead of process.env.REACT_APP_*
-const API_BASE_URL = import.meta.env.VITE_API_URL
+const API_BASE_URL = import.meta.env.VITE_API_URL || 'http://localhost:5000/api'
 
 const api = axios.create({
     baseURL: API_BASE_URL,
@@ -42,11 +42,13 @@ export const problemsAPI = {
 }
 
 export const submissionsAPI = {
-    submit:  (data)   => api.post('/submissions', data),
-    run:     (data)   => api.post('/submissions/run', data),
-    getAll:  (params) => api.get('/submissions', { params }),
-    getById: (id)     => api.get(`/submissions/${id}`)
+    submit:    (data)   => api.post('/submissions', data),
+    run:       (data)   => api.post('/submissions/run', data),
+    runCustom: (data)   => api.post('/submissions/run-custom', data),
+    getAll:    (params) => api.get('/submissions', { params }),
+    getById:   (id)     => api.get(`/submissions/${id}`)
 }
+
 
 export const contestsAPI = {
     getAll:      ()           => api.get('/contests'),

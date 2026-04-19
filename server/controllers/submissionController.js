@@ -170,6 +170,40 @@ exports.runCode = async (req, res) => {
     }
 };
 
+/**
+ * POST /api/submissions/run-custom
+ * Run code against a single user-provided stdin string. No DB save, no test
+ * case comparison — returns raw stdout / stderr / compile_output from Judge0.
+ * Used by the "Custom Input" panel in the frontend.
+ */
+exports.runCustom = async (req, res) => {
+    try {
+        const { code, language, stdin = '' } = req.body;
+
+        if (!code || !language) {
+            return res.status(400).json({ message: 'code and language are required' });
+        }
+
+        // Build a synthetic single test case with the user's stdin
+        const syntheticTestCase = [{ stdin, expectedStdout: '', input: null, expectedOutput: null, isPublic: true }];
+
+        const executionResult = await codeExecutor.executeCode(code, syntheticTestCase, language, null);
+
+        const r = executionResult.testResults[0] || {};
+        res.json({
+            isCustomRun:    true,
+            status:         executionResult.status,
+            stdout:         r.stdout        ?? r.actualOutput ?? null,
+            stderr:         r.stderr        ?? null,
+            compileOutput:  r.compileOutput ?? null,
+            error:          r.error         ?? null,
+            runtime:        executionResult.runtime
+        });
+    } catch (error) {
+        res.status(500).json({ message: 'Server error', error: error.message });
+    }
+};
+
 exports.getSubmissions = async (req, res) => {
     try {
         const { problemId, contestId } = req.query;

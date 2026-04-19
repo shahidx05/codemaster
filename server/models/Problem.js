@@ -29,6 +29,10 @@ const problemSchema = new mongoose.Schema({
     testCases: [{
         input: mongoose.Schema.Types.Mixed,
         expectedOutput: mongoose.Schema.Types.Mixed,
+        // Plain-text stdin passed to C++/Python programs via Judge0
+        stdin: { type: String, default: '' },
+        // Plain-text expected stdout for C++/Python comparison (trimmed)
+        expectedStdout: { type: String, default: '' },
         // true  → show full input/output to student on wrong answer
         // false → show only pass/fail, never reveal input or output
         isPublic: {

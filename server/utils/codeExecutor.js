@@ -2,151 +2,53 @@
  * CodeExecutor
  *
  * JavaScript: executed locally with new Function() + Promise timeout.
- *   Note: new Function() cannot kill true infinite loops (single-threaded JS).
- *   For production, replace with a sandboxed VM (isolated-vm / Docker).
  *
- * C++: sent to Piston public API (https://emkc.org/api/v2/piston).
- *   No API key or Docker required — Node 18+ native fetch() is used.
- *   Each Problem document stores a `cppWrapper` field: a complete main()
- *   function that reads JSON from stdin, calls the student's solution(),
- *   and prints the result as JSON to stdout.
- *   A shared JSON utility header is prepended to every C++ submission so
- *   wrappers can use helpers like _jsonIntArray(), _jsonString(), etc.
+ * C++ (language_id 54) and Python (language_id 71):
+ *   Submitted to Judge0 CE public API — https://ce.judge0.com
+ *   POST /submissions?base64_encoded=false&wait=true
+ *
+ *   Each test case must have:
+ *     stdin         {string}  — plain-text input sent to the program
+ *     expectedStdout {string} — plain-text expected stdout (trimmed comparison)
+ *
+ *   Judge0 returns: stdout, stderr, compile_output, status.id, time, memory
  */
 
-// ── Shared C++ JSON utility header ───────────────────────────────────────────
-// Prepended to every C++ Piston submission. Provides lightweight JSON
-// parsing without any external libraries.
-const CPP_JSON_UTILS = `#include <bits/stdc++.h>
-using namespace std;
+const JUDGE0_URL     = 'https://ce.judge0.com/submissions?base64_encoded=false&wait=true';
+const JUDGE0_TIMEOUT = 20_000; // 20 s hard HTTP timeout
+const JS_TIMEOUT_MS  = 3_000;
 
-// ── auto-injected JSON helpers ────────────────────────────────────────────────
+// Judge0 language IDs
+const LANG = { cpp: 54, python: 71 };
 
-long long _jsonInt(const string& s, const string& key = "") {
-    string src = s;
-    if (!key.empty()) {
-        string k = "\\"" + key + "\\":";
-        size_t p = src.find(k);
-        if (p == string::npos) return 0;
-        src = src.substr(p + k.size());
-    }
-    size_t i = 0;
-    while (i < src.size() && src[i] == ' ') i++;
-    size_t j = i;
-    if (j < src.size() && src[j] == '-') j++;
-    while (j < src.size() && isdigit(src[j])) j++;
-    if (i == j) return 0;
-    return stoll(src.substr(i, j - i));
-}
-
-bool _jsonBool(const string& s, const string& key = "") {
-    string src = s;
-    if (!key.empty()) {
-        string k = "\\"" + key + "\\":";
-        size_t p = src.find(k);
-        if (p == string::npos) return false;
-        src = src.substr(p + k.size());
-    }
-    size_t p = src.find_first_of("tf");
-    if (p == string::npos) return false;
-    return src[p] == 't';
-}
-
-vector<int> _jsonIntArray(const string& s, const string& key = "") {
-    string src = s;
-    if (!key.empty()) {
-        string k = "\\"" + key + "\\":";
-        size_t p = src.find(k);
-        if (p == string::npos) return {};
-        src = src.substr(p + k.size());
-    }
-    size_t a = src.find('['), b = src.find(']');
-    if (a == string::npos) return {};
-    string inner = src.substr(a + 1, b - a - 1);
-    vector<int> res;
-    stringstream ss(inner);
-    string tok;
-    while (getline(ss, tok, ',')) {
-        tok.erase(remove_if(tok.begin(), tok.end(), ::isspace), tok.end());
-        if (!tok.empty()) res.push_back(stoi(tok));
-    }
-    return res;
-}
-
-vector<char> _jsonCharArray(const string& s, const string& key = "") {
-    string src = s;
-    if (!key.empty()) {
-        string k = "\\"" + key + "\\":";
-        size_t p = src.find(k);
-        if (p == string::npos) return {};
-        src = src.substr(p + k.size());
-    }
-    size_t start = src.find('['), stop = src.rfind(']');
-    if (start == string::npos) return {};
-    vector<char> res;
-    for (size_t i = start + 1; i < stop; i++) {
-        if (src[i] == '"' && i + 2 <= stop && src[i + 2] == '"') {
-            res.push_back(src[i + 1]);
-            i += 2;
-        }
-    }
-    return res;
-}
-
-string _jsonString(const string& s, const string& key = "") {
-    string src = s;
-    if (!key.empty()) {
-        string k = "\\"" + key + "\\":\\"";
-        size_t p = src.find(k);
-        if (p == string::npos) {
-            k = "\\"" + key + "\\":";
-            p = src.find(k);
-            if (p == string::npos) return "";
-            src = src.substr(p + k.size());
-            size_t q = src.find('"');
-            if (q == string::npos) return "";
-            src = src.substr(q + 1);
-        } else {
-            src = src.substr(p + k.size());
-        }
-    } else {
-        size_t q = src.find('"');
-        if (q == string::npos) return src;
-        src = src.substr(q + 1);
-    }
-    string res;
-    for (size_t i = 0; i < src.size(); i++) {
-        if (src[i] == '"') break;
-        if (src[i] == '\\\\' && i + 1 < src.size()) { res += src[++i]; continue; }
-        res += src[i];
-    }
-    return res;
-}
-// ─────────────────────────────────────────────────────────────────────────────
-`;
-
-const PISTON_URL      = 'https://emkc.org/api/v2/piston/execute';
-const PISTON_TIMEOUT_S = 3;    // seconds passed to Piston run_timeout
-const JS_TIMEOUT_MS   = 3000;  // milliseconds for local JS execution
+// Judge0 status IDs
+const J0 = {
+    ACCEPTED:          3,
+    WRONG_ANSWER:      4,
+    TIME_LIMIT:        5,
+    COMPILATION_ERROR: 6,
+    // 7-12 are various runtime errors (SIGSEGV, SIGABRT, etc.)
+};
 
 class CodeExecutor {
+
     /**
+     * Main entry point.
      * @param {string} code       Student's submitted code
-     * @param {Array}  testCases  Array of { input, expectedOutput, isPublic }
-     * @param {string} language   'javascript' | 'cpp'
-     * @param {object} problem    Full Problem document (required for C++ cppWrapper)
+     * @param {Array}  testCases  Array of { input, expectedOutput, stdin, expectedStdout, isPublic }
+     * @param {string} language   'javascript' | 'cpp' | 'python'
+     * @param {object} _problem   Unused (kept for API compatibility)
      */
-    async executeCode(code, testCases, language = 'javascript', problem = null) {
-        if (language === 'cpp') {
-            return this._executeCpp(code, testCases, problem);
+    async executeCode(code, testCases, language = 'javascript', _problem = null) {
+        if (!code || !code.trim()) {
+            return this._emptyCodeResponse(testCases);
         }
-        if (language === 'python') {
-            return this._executePython(code, testCases, problem);
-        }
+        if (language === 'cpp')    return this._executeWithJudge0(code, testCases, LANG.cpp);
+        if (language === 'python') return this._executeWithJudge0(code, testCases, LANG.python);
         return this._executeJavaScript(code, testCases);
     }
 
-    // ── JavaScript (local, timeout guarded) ──────────────────────────────────
+    // ── JavaScript (local, timeout-guarded) ──────────────────────────────────
 
     async _executeJavaScript(code, testCases) {
         const results = [];
@@ -159,38 +61,29 @@ class CodeExecutor {
                 const passed = JSON.stringify(actualOutput) === JSON.stringify(tc.expectedOutput);
                 if (!passed) allPassed = false;
                 results.push({
-                    testCase: i + 1,
-                    passed,
-                    input: tc.input,
-                    expectedOutput: tc.expectedOutput,
-                    actualOutput,
-                    error: null,
-                    isPublic: tc.isPublic ?? false
+                    testCase: i + 1, passed,
+                    input: tc.input, expectedOutput: tc.expectedOutput, actualOutput,
+                    error: null, isPublic: tc.isPublic ?? false
                 });
             } catch (err) {
                 allPassed = false;
                 results.push({
-                    testCase: i + 1,
-                    passed: false,
-                    input: tc.input,
-                    expectedOutput: tc.expectedOutput,
-                    actualOutput: null,
-                    error: err.message,
-                    isPublic: tc.isPublic ?? false
+                    testCase: i + 1, passed: false,
+                    input: tc.input, expectedOutput: tc.expectedOutput, actualOutput: null,
+                    error: err.message, isPublic: tc.isPublic ?? false
                 });
             }
         }
 
-        const hasTLE = results.some(r => r.error && r.error.includes('Time Limit Exceeded'));
+        const hasTLE = results.some(r => r.error?.includes('Time Limit Exceeded'));
         const hasErr = results.some(r => r.error && !r.error.includes('Time Limit Exceeded'));
-        const status = allPassed        ? 'Accepted'
-            : hasTLE                   ? 'Time Limit Exceeded'
-            : hasErr                   ? 'Runtime Error'
-            :                            'Wrong Answer';
+        const status = allPassed      ? 'Accepted'
+                     : hasTLE         ? 'Time Limit Exceeded'
+                     : hasErr         ? 'Runtime Error'
+                     : 'Wrong Answer';
 
         return {
-            status,
-            testResults: results,
+            status, testResults: results,
             runtime: Math.floor(Math.random() * 80) + 10,
             memory:  Math.floor(Math.random() * 15) + 5
         };
@@ -198,9 +91,7 @@ class CodeExecutor {
 
     _runWithTimeout(code, input, timeoutMs) {
         return new Promise((resolve, reject) => {
-            const timer = setTimeout(() => {
-                reject(new Error('Time Limit Exceeded'));
-            }, timeoutMs);
+            const timer = setTimeout(() => reject(new Error('Time Limit Exceeded')), timeoutMs);
             try {
                 const wrapped = `${code}\nreturn solution(${JSON.stringify(input)});`;
                 // eslint-disable-next-line no-new-func
@@ -214,294 +105,156 @@ class CodeExecutor {
         });
     }
 
-    // ── C++ via Piston API ────────────────────────────────────────────────────
+    // ── Judge0 — C++ and Python ───────────────────────────────────────────────
 
-    async _executeCpp(code, testCases, problem) {
-        const wrapper = problem?.cppWrapper?.trim() || '';
-        if (!wrapper) {
-            return this._cppNotConfigured(testCases);
-        }
-
-        // Full source sent to Piston: JSON utils + student code + problem wrapper
-        const fullSource = `${CPP_JSON_UTILS}\n${code}\n${wrapper}`;
-
-        const results      = [];
-        let   allPassed    = true;
-        let   finalStatus  = 'Accepted';
-        let   totalRuntime = 0;
+    async _executeWithJudge0(code, testCases, languageId) {
+        const results    = [];
+        let allPassed    = true;
+        let finalStatus  = 'Accepted';
+        let totalRuntime = 0;
+        let maxMemory    = 0;
 
         for (let i = 0; i < testCases.length; i++) {
-            const tc    = testCases[i];
-            const stdin = JSON.stringify(tc.input);
+            const tc             = testCases[i];
+            const stdin          = tc.stdin ?? '';
+            const expectedStdout = (tc.expectedStdout ?? '').trim();
 
-            let piston;
+            // ── Call Judge0 ──────────────────────────────────────────────────
+            let j0;
             try {
-                piston = await this._callPiston(fullSource, stdin, 'cpp', '10.2.0');
+                j0 = await this._callJudge0(code, stdin, languageId);
             } catch (fetchErr) {
                 allPassed   = false;
                 finalStatus = 'Runtime Error';
-                results.push({
-                    testCase: i + 1,
-                    passed: false,
-                    input: tc.input,
-                    expectedOutput: tc.expectedOutput,
-                    actualOutput: null,
-                    error: 'C++/Python judge is temporarily unavailable. Please try JavaScript or try again later.',
-                    isPublic: tc.isPublic ?? false
-                });
+                results.push(this._apiErrorResult(i, tc, fetchErr.message));
                 continue;
             }
 
-            const { compile, run } = piston;
+            const statusId      = j0.status?.id ?? 0;
+            const stdout        = (j0.stdout        || '').trim();
+            const stderr        = (j0.stderr        || '').trim();
+            const compileOutput = (j0.compile_output || '').trim();
+            totalRuntime       += parseFloat(j0.time   || '0');
+            maxMemory           = Math.max(maxMemory, j0.memory || 0);
 
-            // Compilation error → all subsequent test cases also fail
-            if (compile && compile.code !== 0) {
+            // ── Compilation Error ────────────────────────────────────────────
+            if (statusId === J0.COMPILATION_ERROR) {
                 allPassed   = false;
                 finalStatus = 'Compilation Error';
-                const errMsg = (compile.stderr || compile.output || 'Compilation failed').slice(0, 500);
+                const errMsg = compileOutput || 'Compilation failed.';
+                // All remaining test cases also fail
                 for (let j = i; j < testCases.length; j++) {
+                    const t = testCases[j];
                     results.push({
-                        testCase: j + 1,
-                        passed: false,
-                        input: testCases[j].input,
-                        expectedOutput: testCases[j].expectedOutput,
-                        actualOutput: null,
-                        error: errMsg,
-                        isPublic: testCases[j].isPublic ?? false
+                        testCase: j + 1, passed: false,
+                        input: t.input, expectedOutput: t.expectedOutput,
+                        expectedStdout: (t.expectedStdout ?? '').trim(),
+                        actualOutput: null, stdout: null, stderr: null,
+                        compileOutput: errMsg, error: errMsg,
+                        isPublic: t.isPublic ?? false
                     });
                 }
                 break;
             }
 
-            // Time Limit Exceeded: Piston sends SIGKILL when run_timeout is hit
-            if (run.signal === 'SIGKILL') {
+            // ── Time Limit Exceeded ──────────────────────────────────────────
+            if (statusId === J0.TIME_LIMIT) {
                 allPassed = false;
                 if (finalStatus === 'Accepted') finalStatus = 'Time Limit Exceeded';
                 results.push({
-                    testCase: i + 1,
-                    passed: false,
-                    input: tc.input,
-                    expectedOutput: tc.expectedOutput,
-                    actualOutput: null,
-                    error: `Time Limit Exceeded (>${PISTON_TIMEOUT_S}s)`,
-                    isPublic: tc.isPublic ?? false
+                    testCase: i + 1, passed: false,
+                    input: tc.input, expectedOutput: tc.expectedOutput,
+                    expectedStdout, actualOutput: null,
+                    stdout: null, stderr: 'Time Limit Exceeded', compileOutput: null,
+                    error: 'Time Limit Exceeded', isPublic: tc.isPublic ?? false
                 });
                 continue;
             }
 
-            // Runtime Error: non-zero exit or stderr output
-            if (run.code !== 0 || (run.stderr && run.stderr.trim())) {
+            // ── Runtime Error (any non-accepted, non-WA status) ──────────────
+            if (statusId !== J0.ACCEPTED && statusId !== J0.WRONG_ANSWER) {
                 allPassed = false;
                 if (finalStatus === 'Accepted') finalStatus = 'Runtime Error';
-                const errMsg = (run.stderr || `Process exited with code ${run.code}`).slice(0, 300);
+                const errMsg = stderr || `Runtime error (Judge0 status ${statusId})`;
                 results.push({
-                    testCase: i + 1,
-                    passed: false,
-                    input: tc.input,
-                    expectedOutput: tc.expectedOutput,
-                    actualOutput: null,
-                    error: errMsg,
+                    testCase: i + 1, passed: false,
+                    input: tc.input, expectedOutput: tc.expectedOutput,
+                    expectedStdout, actualOutput: null,
+                    stdout: stdout || null, stderr: errMsg,
+                    compileOutput: compileOutput || null, error: errMsg,
                     isPublic: tc.isPublic ?? false
                 });
                 continue;
             }
 
-            // Compare stdout against expected output (both as JSON strings)
-            const rawOut  = (run.stdout || '').trim();
-            const expected = JSON.stringify(tc.expectedOutput);
-            const passed   = rawOut === expected;
-
+            // ── Compare stdout ───────────────────────────────────────────────
+            const passed = stdout === expectedStdout;
             if (!passed) {
                 allPassed = false;
                 if (finalStatus === 'Accepted') finalStatus = 'Wrong Answer';
             }
 
-            let actualOutput;
-            try { actualOutput = JSON.parse(rawOut); }
-            catch { actualOutput = rawOut; }
-
-            totalRuntime += run.time ?? 0;
-
             results.push({
-                testCase: i + 1,
-                passed,
-                input: tc.input,
-                expectedOutput: tc.expectedOutput,
-                actualOutput,
-                error: null,
+                testCase: i + 1, passed,
+                input: tc.input, expectedOutput: tc.expectedOutput,
+                expectedStdout, actualOutput: stdout,
+                stdout, stderr: stderr || null,
+                compileOutput: compileOutput || null, error: null,
                 isPublic: tc.isPublic ?? false
             });
         }
 
         return {
-            status: finalStatus,
+            status:      finalStatus,
             testResults: results,
-            runtime: Math.round(totalRuntime * 1000), // convert s → ms
-            memory: 0 // Piston free tier does not expose memory usage
+            runtime:     Math.round(totalRuntime * 1000),   // s → ms
+            memory:      Math.round(maxMemory    / 1024)    // KB → MB approx
         };
     }
 
-    async _callPiston(source, stdin, language = 'cpp', version = '10.2.0') {
-        const body = {
-            language,
-            version,
-            files: [{ content: source }],
-            stdin,
-            args: [],
-            compile_timeout: 10,
-            run_timeout: PISTON_TIMEOUT_S,
-            compile_memory_limit: -1,
-            run_memory_limit: 268435456  // 256 MB
-        };
+    async _callJudge0(sourceCode, stdin, languageId) {
+        const headers = { 'Content-Type': 'application/json' };
+        // Optional: set JUDGE0_API_KEY in .env for higher rate limits
+        if (process.env.JUDGE0_API_KEY) {
+            headers['X-Auth-Token'] = process.env.JUDGE0_API_KEY;
+        }
 
-        const response = await fetch(PISTON_URL, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify(body),
-            signal: AbortSignal.timeout(20000) // 20 s hard HTTP timeout
+        const response = await fetch(JUDGE0_URL, {
+            method:  'POST',
+            headers,
+            body:    JSON.stringify({ source_code: sourceCode, language_id: languageId, stdin: stdin || '' }),
+            signal:  AbortSignal.timeout(JUDGE0_TIMEOUT)
         });
 
         if (!response.ok) {
-            throw new Error(`Piston returned HTTP ${response.status}`);
+            const text = await response.text().catch(() => '');
+            throw new Error(`Judge0 HTTP ${response.status}: ${text.slice(0, 300)}`);
         }
         return response.json();
     }
 
-    // ── Python via Piston API ──────────────────────────────────────────────────
+    // ── Helpers ───────────────────────────────────────────────────────────────
 
-    async _executePython(code, testCases, problem) {
-        const wrapper = problem?.pyWrapper?.trim() || '';
-        if (!wrapper) {
-            return this._pythonNotConfigured(testCases);
-        }
-
-        const fullSource = `${code}\n${wrapper}`;
-
-        const results      = [];
-        let   allPassed    = true;
-        let   finalStatus  = 'Accepted';
-        let   totalRuntime = 0;
-
-        for (let i = 0; i < testCases.length; i++) {
-            const tc    = testCases[i];
-            const stdin = JSON.stringify(tc.input);
-
-            let piston;
-            try {
-                piston = await this._callPiston(fullSource, stdin, 'python', '3.10.0');
-            } catch (fetchErr) {
-                allPassed   = false;
-                finalStatus = 'Runtime Error';
-                results.push({
-                    testCase: i + 1,
-                    passed: false,
-                    input: tc.input,
-                    expectedOutput: tc.expectedOutput,
-                    actualOutput: null,
-                    error: 'C++/Python judge is temporarily unavailable. Please try JavaScript or try again later.',
-                    isPublic: tc.isPublic ?? false
-                });
-                continue;
-            }
-
-            const { run } = piston;
-
-            if (run.signal === 'SIGKILL') {
-                allPassed = false;
-                if (finalStatus === 'Accepted') finalStatus = 'Time Limit Exceeded';
-                results.push({
-                    testCase: i + 1,
-                    passed: false,
-                    input: tc.input,
-                    expectedOutput: tc.expectedOutput,
-                    actualOutput: null,
-                    error: `Time Limit Exceeded (>${PISTON_TIMEOUT_S}s)`,
-                    isPublic: tc.isPublic ?? false
-                });
-                continue;
-            }
-
-            if (run.code !== 0 || (run.stderr && run.stderr.trim())) {
-                allPassed = false;
-                if (finalStatus === 'Accepted') finalStatus = 'Runtime Error';
-                const errMsg = (run.stderr || `Process exited with code ${run.code}`).slice(0, 300);
-                results.push({
-                    testCase: i + 1,
-                    passed: false,
-                    input: tc.input,
-                    expectedOutput: tc.expectedOutput,
-                    actualOutput: null,
-                    error: errMsg,
-                    isPublic: tc.isPublic ?? false
-                });
-                continue;
-            }
-
-            const rawOut   = (run.stdout || '').trim();
-            const expected = JSON.stringify(tc.expectedOutput);
-            const passed   = rawOut === expected;
-
-            if (!passed) {
-                allPassed = false;
-                if (finalStatus === 'Accepted') finalStatus = 'Wrong Answer';
-            }
-
-            let actualOutput;
-            try { actualOutput = JSON.parse(rawOut); }
-            catch { actualOutput = rawOut; }
-
-            totalRuntime += run.time ?? 0;
-
-            results.push({
-                testCase: i + 1,
-                passed,
-                input: tc.input,
-                expectedOutput: tc.expectedOutput,
-                actualOutput,
-                error: null,
-                isPublic: tc.isPublic ?? false
-            });
-        }
-
+    _apiErrorResult(i, tc, message) {
         return {
-            status: finalStatus,
-            testResults: results,
-            runtime: Math.round(totalRuntime * 1000),
-            memory: 0
+            testCase: i + 1, passed: false,
+            input: tc.input, expectedOutput: tc.expectedOutput,
+            actualOutput: null, stdout: null, stderr: null, compileOutput: null,
+            error: `Code execution service unavailable: ${message}. Please try again.`,
+            isPublic: tc.isPublic ?? false
         };
     }
 
-    _cppNotConfigured(testCases) {
+    _emptyCodeResponse(testCases) {
         return {
             status: 'Runtime Error',
             testResults: testCases.map((tc, i) => ({
-                testCase: i + 1,
-                passed: false,
-                input: tc.input,
-                expectedOutput: tc.expectedOutput,
-                actualOutput: null,
-                error: 'C++ is not configured for this problem. Please use JavaScript.',
+                testCase: i + 1, passed: false,
+                input: tc.input, expectedOutput: tc.expectedOutput,
+                actualOutput: null, error: 'No code submitted.',
                 isPublic: tc.isPublic ?? false
             })),
-            runtime: 0,
-            memory: 0
-        };
-    }
-
-    _pythonNotConfigured(testCases) {
-        return {
-            status: 'Runtime Error',
-            testResults: testCases.map((tc, i) => ({
-                testCase: i + 1,
-                passed: false,
-                input: tc.input,
-                expectedOutput: tc.expectedOutput,
-                actualOutput: null,
-                error: 'Python is not configured for this problem. Please use JavaScript.',
-                isPublic: tc.isPublic ?? false
-            })),
-            runtime: 0,
-            memory: 0
+            runtime: 0, memory: 0
         };
     }
 }
