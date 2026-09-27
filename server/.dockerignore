@@ -1,0 +1,31 @@
+﻿# Dependencies
+node_modules/
+
+# Environment secrets — never bake into the image
+.env
+.env.*
+!.env.example
+
+# Version control
+.git/
+.gitignore
+
+# Logs
+logs/
+*.log
+npm-debug.log*
+
+# OS artefacts
+.DS_Store
+Thumbs.db
+
+# Editor/IDE metadata
+.vscode/
+.idea/
+
+# Docker files themselves (not needed inside the image)
+Dockerfile
+.dockerignore
+
+# Seed scripts are not needed at runtime
+seed/
