@@ -1,0 +1,120 @@
+﻿# =============================================================================
+# docker-compose.yml — Full-stack local development orchestration
+#
+# Services:
+#   mongo    — MongoDB 7 with data persistence & healthcheck
+#   redis    — Redis 7 Alpine with AOF persistence & healthcheck
+#   backend  — Node/Express API (builds from server/Dockerfile)
+#   frontend — React/Vite SPA served by nginx (builds from client/Dockerfile)
+#
+# Usage:
+#   docker compose up --build          # first run / after code changes
+#   docker compose up -d               # detached (subsequent runs)
+#   docker compose logs -f backend     # follow a single service
+#   docker compose down -v             # stop + delete volumes
+# =============================================================================
+
+services:
+
+  # ---------------------------------------------------------------------------
+  # MongoDB 7
+  # ---------------------------------------------------------------------------
+  mongo:
+    image: mongo:7.0.21
+    container_name: codemaster-mongo
+    restart: unless-stopped
+    volumes:
+      - mongo_data:/data/db
+    ports:
+      - "27017:27017"           # expose for Compass / mongosh on the host
+    networks:
+      - codemaster-net
+    healthcheck:
+      test: ["CMD", "mongosh", "--quiet", "--eval", "db.adminCommand('ping').ok"]
+      interval: 15s
+      timeout: 10s
+      start_period: 20s
+      retries: 5
+
+  # ---------------------------------------------------------------------------
+  # Redis 7 (Alpine) — AOF + RDB persistence
+  # ---------------------------------------------------------------------------
+  redis:
+    image: redis:7.4.3-alpine
+    container_name: codemaster-redis
+    restart: unless-stopped
+    command: >
+      redis-server
+      --appendonly yes
+      --appendfsync everysec
+      --save 60 1
+    volumes:
+      - redis_data:/data
+    ports:
+      - "6379:6379"             # expose for RedisInsight / redis-cli on the host
+    networks:
+      - codemaster-net
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      start_period: 10s
+      retries: 5
+
+  # ---------------------------------------------------------------------------
+  # Backend — Node.js / Express API
+  # ---------------------------------------------------------------------------
+  backend:
+    build:
+      context: ./server
+      dockerfile: Dockerfile
+    image: codemaster-server:local
+    container_name: codemaster-backend
+    restart: unless-stopped
+    env_file:
+      - .env                    # root-level .env; overrides defaults below
+    environment:
+      NODE_ENV: production
+      PORT: "5000"
+    ports:
+      - "5000:5000"
+    networks:
+      - codemaster-net
+    depends_on:
+      mongo:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  # ---------------------------------------------------------------------------
+  # Frontend — React + Vite static SPA served by nginx
+  # ---------------------------------------------------------------------------
+  frontend:
+    build:
+      context: ./client
+      dockerfile: Dockerfile
+    image: codemaster-frontend:local
+    container_name: codemaster-frontend
+    restart: unless-stopped
+    ports:
+      - "8080:80"               # access at http://localhost:8080
+    networks:
+      - codemaster-net
+    depends_on:
+      - backend
+
+# =============================================================================
+# Named volumes — survive `docker compose down` (use -v to also delete them)
+# =============================================================================
+volumes:
+  mongo_data:
+    driver: local
+  redis_data:
+    driver: local
+
+# =============================================================================
+# Custom bridge network — all services can reach each other by service name
+# =============================================================================
+networks:
+  codemaster-net:
+    driver: bridge
