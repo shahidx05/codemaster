@@ -1,9 +1,14 @@
-const express    = require('express');
-const mongoose   = require('mongoose');
-const cors       = require('cors');
-const helmet     = require('helmet');
-const rateLimit  = require('express-rate-limit');
+const express        = require('express');
+const mongoose       = require('mongoose');
+const cors           = require('cors');
+const helmet         = require('helmet');
+const rateLimit      = require('express-rate-limit');
+const { RedisStore } = require('rate-limit-redis');
 require('dotenv').config();
+
+// Shared Redis client — connects on require(), logs errors, retries automatically.
+// See config/redis.js for the fail-fast / degrade-gracefully decision.
+const redisClient = require('./config/redis');
 
 const authRoutes       = require('./routes/auth');
 const problemRoutes    = require('./routes/problems');
@@ -29,13 +34,33 @@ app.use(cors({
 // Body size cap
 app.use(express.json({ limit: '10kb' }));
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Rate limiters — backed by Redis via rate-limit-redis + ioredis
+//
+// WHY REDIS INSTEAD OF THE DEFAULT IN-MEMORY STORE:
+//   1. Restart resilience: the in-memory store lived inside the Node process,
+//      so every container restart silently reset all counters to zero — an
+//      attacker could trivially bypass limits by triggering a restart.
+//   2. Replica consistency: if the backend is ever scaled to multiple instances
+//      (multiple containers behind a load balancer), each would have its own
+//      isolated counter. An IP could hit N × limit requests per window by
+//      spreading requests across replicas. A shared Redis store ensures all
+//      instances see and update the same counter.
+// ─────────────────────────────────────────────────────────────────────────────
+
 // Global rate limiter: 100 requests per 15 minutes per IP
 const globalLimiter = rateLimit({
     windowMs: 15 * 60 * 1000,
     max: 100,
     standardHeaders: true,
     legacyHeaders: false,
-    message: { message: 'Too many requests, please try again later.' }
+    message: { message: 'Too many requests, please try again later.' },
+    store: new RedisStore({
+        // ioredis uses .call() instead of .sendCommand()
+        sendCommand: (...args) => redisClient.call(...args),
+        // Prefix isolates these keys from any other Redis usage
+        prefix: 'rl:global:',
+    }),
 });
 
 // Submission limiter: 10 per minute per IP
@@ -44,7 +69,11 @@ const globalLimiter = rateLimit({
 const submissionLimiter = rateLimit({
     windowMs: 60 * 1000,
     max: 10,
-    message: { message: 'Too many submissions. Please wait before submitting again.' }
+    message: { message: 'Too many submissions. Please wait before submitting again.' },
+    store: new RedisStore({
+        sendCommand: (...args) => redisClient.call(...args),
+        prefix: 'rl:submissions:',
+    }),
 });
 
 app.use(globalLimiter);

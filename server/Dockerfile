@@ -1,4 +1,4 @@
-﻿# =============================================================================
+# =============================================================================
 # Stage 1 — builder
 #   Installs ALL dependencies (including devDependencies) so that any future
 #   build step (transpilation, asset generation, etc.) can run here without
@@ -41,6 +41,7 @@ RUN npm ci --omit=dev && npm cache clean --force
 
 # Copy application source from builder
 COPY --from=builder /app/server.js    ./server.js
+COPY --from=builder /app/config       ./config
 COPY --from=builder /app/controllers  ./controllers
 COPY --from=builder /app/middleware   ./middleware
 COPY --from=builder /app/models       ./models
