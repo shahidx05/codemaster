@@ -9,6 +9,10 @@ router.post('/run-custom', authMiddleware, submissionController.runCustom);
 
 router.post('/', authMiddleware, submissionController.submitCode);
 router.get('/',  authMiddleware, submissionController.getSubmissions);
-router.get('/:id', authMiddleware, submissionController.getSubmissionById);
+
+// GET /:id/status — lightweight polling endpoint (declared BEFORE /:id)
+router.get('/:id/status', authMiddleware, submissionController.getSubmissionStatus);
+router.get('/:id',        authMiddleware, submissionController.getSubmissionById);
 
 module.exports = router;
+

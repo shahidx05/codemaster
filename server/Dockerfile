@@ -41,10 +41,12 @@ RUN npm ci --omit=dev && npm cache clean --force
 
 # Copy application source from builder
 COPY --from=builder /app/server.js    ./server.js
+COPY --from=builder /app/worker.js    ./worker.js
 COPY --from=builder /app/config       ./config
 COPY --from=builder /app/controllers  ./controllers
 COPY --from=builder /app/middleware   ./middleware
 COPY --from=builder /app/models       ./models
+COPY --from=builder /app/queues       ./queues
 COPY --from=builder /app/routes       ./routes
 COPY --from=builder /app/utils        ./utils
 

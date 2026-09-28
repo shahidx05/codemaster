@@ -1,6 +1,6 @@
-import { useState, useEffect, useCallback } from 'react'
+import { useState, useEffect, useCallback, useRef } from 'react'
 import { useParams, useSearchParams, Link } from 'react-router-dom'
-import { problemsAPI, submissionsAPI, contestsAPI } from '../services/api'
+import { problemsAPI, submissionsAPI, contestsAPI, pollUntilDone } from '../services/api'
 import CodeEditor from '../components/CodeEditor'
 import TestResults from '../components/TestResults'
 import { useAuth } from '../context/AuthContext'
@@ -92,11 +92,14 @@ const ProblemDetailPage = () => {
     const [testResults,    setTestResults]    = useState(null)
     const [customResult,   setCustomResult]   = useState(null)
     const [submitStatus,   setSubmitStatus]   = useState(null)
+    const [submitPhase,    setSubmitPhase]    = useState(null) // 'queued' | 'processing' | null
     const [isRunResult,    setIsRunResult]    = useState(false)
     const [activeTab,      setActiveTab]      = useState('description')
     const [error,          setError]          = useState('')
     const [stdinOpen,      setStdinOpen]      = useState(false)
     const [customStdin,    setCustomStdin]    = useState('')
+
+    const submitAbortRef = useRef(null) // AbortController for the polling loop
 
     const [contestProblems, setContestProblems] = useState([])
 
@@ -112,6 +115,11 @@ const ProblemDetailPage = () => {
     }, [id])
 
     useEffect(() => { fetchProblem() }, [fetchProblem])
+
+    // Abort any in-flight polling when the component unmounts
+    useEffect(() => {
+        return () => { submitAbortRef.current?.abort() }
+    }, [])
 
     useEffect(() => {
         if (!contestId) return
@@ -172,21 +180,48 @@ const ProblemDetailPage = () => {
     const handleSubmit = async () => {
         if (!isAuthenticated) { setError('Please log in to submit.'); return }
         if (!code.trim())     { setError('Please write some code first.'); return }
+
+        // Abort any previous in-flight poll
+        submitAbortRef.current?.abort()
+        const abortCtrl = new AbortController()
+        submitAbortRef.current = abortCtrl
+
         setSubmitting(true); setError(''); setTestResults(null); setCustomResult(null)
-        setSubmitStatus(null); setIsRunResult(false)
+        setSubmitStatus(null); setSubmitPhase('queued'); setIsRunResult(false)
+        setActiveTab('results')
+
         try {
             const payload = { problemId: id, code, language }
             if (contestId) payload.contestId = contestId
+
+            // POST → 202 immediately (submission is now Queued)
             const res = await submissionsAPI.submit(payload)
-            const sub = res.data.submission
+            const { submissionId } = res.data
+
+            // Poll until terminal status, updating phase label as we go
+            const result = await pollUntilDone(
+                submissionId,
+                (status) => {
+                    setSubmitPhase(status === 'Processing' ? 'processing' : 'queued')
+                    setSubmitStatus(status)
+                },
+                { signal: abortCtrl.signal }
+            )
+
+            const sub = result.submission
             setTestResults(sub.testResults)
             setSubmitStatus(sub.status)
+            setSubmitPhase(null)
             setIsRunResult(false)
-            setActiveTab('results')
+
             if (contestId && sub.status === 'Accepted') addSolved(contestId, id)
         } catch (err) {
-            setError(err.response?.data?.message || 'Error submitting code.')
-        } finally { setSubmitting(false) }
+            if (err.name === 'AbortError') return // unmounted — ignore
+            setError(err.response?.data?.message || err.message || 'Error submitting code.')
+            setSubmitPhase(null)
+        } finally {
+            setSubmitting(false)
+        }
     }
 
     // ── Next problem ───────────────────────────────────────────────────────────
@@ -358,7 +393,9 @@ const ProblemDetailPage = () => {
                             disabled={isBusy || !isAuthenticated}
                             className="flex items-center gap-2 bg-orange-500 hover:bg-orange-400 disabled:opacity-50 disabled:cursor-not-allowed text-white text-xs font-semibold px-4 py-1.5 rounded-lg transition-colors">
                             {submitting
-                                ? <><FaSpinner className="animate-spin" size={10} /> Submitting…</>
+                                ? submitPhase === 'processing'
+                                    ? <><FaSpinner className="animate-spin" size={10} /> Processing…</>
+                                    : <><FaSpinner className="animate-spin" size={10} /> Queued…</>
                                 : <><FaPlay size={10} /> {contestId ? 'Submit to Contest' : 'Submit'}</>
                             }
                         </button>

@@ -46,7 +46,56 @@ export const submissionsAPI = {
     run:       (data)   => api.post('/submissions/run', data),
     runCustom: (data)   => api.post('/submissions/run-custom', data),
     getAll:    (params) => api.get('/submissions', { params }),
-    getById:   (id)     => api.get(`/submissions/${id}`)
+    getById:   (id)     => api.get(`/submissions/${id}`),
+    getStatus: (id)     => api.get(`/submissions/${id}/status`),
+}
+
+// Terminal statuses — polling stops when any of these is received
+const TERMINAL_STATUSES = new Set([
+    'Accepted', 'Wrong Answer', 'Runtime Error',
+    'Time Limit Exceeded', 'Memory Limit Exceeded',
+    'Compilation Error', 'Error',
+])
+
+/**
+ * pollUntilDone(submissionId, onUpdate, options)
+ *
+ * Polls GET /submissions/:id/status every `intervalMs` ms until:
+ *   - The submission reaches a terminal status  → resolves with the full result
+ *   - `timeoutMs` has elapsed                   → rejects with a timeout error
+ *   - `signal` is aborted (e.g. component unmount) → rejects with AbortError
+ *
+ * onUpdate(status) is called on every poll so the UI can show 'Queued' vs
+ * 'Processing' transitions while waiting.
+ */
+export async function pollUntilDone(
+    submissionId,
+    onUpdate = () => {},
+    { intervalMs = 1500, timeoutMs = 120_000, signal } = {}
+) {
+    const deadline = Date.now() + timeoutMs
+
+    while (true) {
+        if (signal?.aborted) {
+            throw new DOMException('Polling aborted', 'AbortError')
+        }
+        if (Date.now() > deadline) {
+            throw new Error('Submission timed out — please check My Submissions for the result.')
+        }
+
+        const { data } = await submissionsAPI.getStatus(submissionId)
+        onUpdate(data.status)
+
+        if (data.isTerminal) {
+            return data // { submissionId, status, isTerminal: true, submission: {...} }
+        }
+
+        // Wait before next poll
+        await new Promise((resolve, reject) => {
+            const t = setTimeout(resolve, intervalMs)
+            signal?.addEventListener('abort', () => { clearTimeout(t); reject(new DOMException('Polling aborted', 'AbortError')) }, { once: true })
+        })
+    }
 }
 
 

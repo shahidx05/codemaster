@@ -77,7 +77,13 @@ const submissionLimiter = rateLimit({
 });
 
 app.use(globalLimiter);
-app.use('/api/submissions', submissionLimiter);
+// Note: submissionLimiter is applied only to POST (actual code submissions),
+// NOT to GET /status polling — a user polling for their result should not be
+// penalised. The global 100/15min limiter still covers all GET endpoints.
+app.use('/api/submissions', (req, res, next) => {
+    if (req.method === 'POST') return submissionLimiter(req, res, next);
+    next();
+});
 
 // MongoDB connection
 mongoose.connect(process.env.MONGODB_URI)

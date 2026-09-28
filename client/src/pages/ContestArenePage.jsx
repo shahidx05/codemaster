@@ -1,6 +1,6 @@
-import { useState, useEffect, useCallback } from 'react'
+import { useState, useEffect, useCallback, useRef } from 'react'
 import { useParams, useNavigate, Link } from 'react-router-dom'
-import { contestsAPI, problemsAPI, submissionsAPI } from '../services/api'
+import { contestsAPI, problemsAPI, submissionsAPI, pollUntilDone } from '../services/api'
 import { useAuth } from '../context/AuthContext'
 import CodeEditor from '../components/CodeEditor'
 import TestResults from '../components/TestResults'
@@ -74,9 +74,12 @@ const ContestArenePage = () => {
     const [submitting,  setSubmitting]  = useState(false)
     const [testResults, setTestResults] = useState(null)
     const [submitStatus, setSubmitStatus] = useState(null)
+    const [submitPhase,  setSubmitPhase]  = useState(null) // 'queued' | 'processing' | null
     const [isRunResult, setIsRunResult] = useState(false)
     const [activeTab,   setActiveTab]   = useState('description')
     const [error,       setError]        = useState('')
+
+    const submitAbortRef = useRef(null)
 
     // Sidebar
     const [solvedSet, setSolvedSet] = useState(() => getSolvedSet(contestId))
@@ -92,6 +95,9 @@ const ContestArenePage = () => {
             .catch(() => {})
             .finally(() => setContestLoading(false))
     }, [contestId])
+
+    // Abort polling on unmount
+    useEffect(() => { return () => { submitAbortRef.current?.abort() } }, [])
 
     // Load problem
     useEffect(() => {
@@ -136,20 +142,44 @@ const ContestArenePage = () => {
 
     const handleSubmit = async () => {
         if (!isAuthenticated) return
-        setSubmitting(true); setError(''); setTestResults(null); setSubmitStatus(null); setIsRunResult(false)
+
+        // Abort any previous in-flight poll
+        submitAbortRef.current?.abort()
+        const abortCtrl = new AbortController()
+        submitAbortRef.current = abortCtrl
+
+        setSubmitting(true); setError(''); setTestResults(null); setSubmitStatus(null)
+        setSubmitPhase('queued'); setIsRunResult(false)
+        setActiveTab('results')
         try {
+            // POST → 202 immediately
             const res = await submissionsAPI.submit({ problemId, code, language, contestId })
-            const sub = res.data.submission
+            const { submissionId } = res.data
+
+            // Poll until terminal
+            const result = await pollUntilDone(
+                submissionId,
+                (status) => {
+                    setSubmitPhase(status === 'Processing' ? 'processing' : 'queued')
+                    setSubmitStatus(status)
+                },
+                { signal: abortCtrl.signal }
+            )
+
+            const sub = result.submission
             setTestResults(sub.testResults)
             setSubmitStatus(sub.status)
+            setSubmitPhase(null)
             setIsRunResult(false)
-            setActiveTab('results')
+
             if (sub.status === 'Accepted') {
                 addSolved(contestId, problemId)
                 setSolvedSet(getSolvedSet(contestId))
             }
         } catch (err) {
-            setError(err.response?.data?.message || 'Error submitting.')
+            if (err.name === 'AbortError') return
+            setError(err.response?.data?.message || err.message || 'Error submitting.')
+            setSubmitPhase(null)
         } finally { setSubmitting(false) }
     }
 
@@ -403,7 +433,10 @@ const ContestArenePage = () => {
                                 className="flex items-center gap-1.5 bg-orange-500 hover:bg-orange-400 disabled:opacity-40 text-white text-xs font-semibold px-3.5 py-1.5 rounded-lg transition-colors"
                             >
                                 {submitting ? <FaSpinner className="animate-spin" size={10} /> : <FaPlay size={10} />}
-                                {submitting ? 'Submitting…' : 'Submit'}
+                                {submitting
+                                    ? submitPhase === 'processing' ? 'Processing…' : 'Queued…'
+                                    : 'Submit'
+                                }
                             </button>
                         </div>
                     </div>

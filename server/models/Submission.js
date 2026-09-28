@@ -30,13 +30,17 @@ const submissionSchema = new mongoose.Schema({
     status: {
         type: String,
         enum: [
+            'Queued',
+            'Processing',
             'Accepted',
             'Wrong Answer',
             'Runtime Error',
             'Time Limit Exceeded',
             'Memory Limit Exceeded',
-            'Compilation Error'
+            'Compilation Error',
+            'Error',  // terminal error: all retries exhausted / unexpected failure
         ],
+        default: 'Queued',
         required: true
     },
     testResults: [{
@@ -68,5 +72,7 @@ submissionSchema.index({ problem: 1 });
 // Index for contest leaderboard queries
 submissionSchema.index({ contest: 1, user: 1 });
 submissionSchema.index({ contest: 1, status: 1 });
+// Index for status polling (GET /:id/status)
+submissionSchema.index({ _id: 1, status: 1 });
 
 module.exports = mongoose.model('Submission', submissionSchema);

@@ -1,16 +1,18 @@
-﻿# =============================================================================
+# =============================================================================
 # docker-compose.yml — Full-stack local development orchestration
 #
 # Services:
 #   mongo    — MongoDB 7 with data persistence & healthcheck
 #   redis    — Redis 7 Alpine with AOF persistence & healthcheck
 #   backend  — Node/Express API (builds from server/Dockerfile)
+#   worker   — BullMQ submission job processor (same image as backend)
 #   frontend — React/Vite SPA served by nginx (builds from client/Dockerfile)
 #
 # Usage:
 #   docker compose up --build          # first run / after code changes
 #   docker compose up -d               # detached (subsequent runs)
-#   docker compose logs -f backend     # follow a single service
+#   docker compose logs -f backend     # follow the API server
+#   docker compose logs -f worker      # follow worker job processing
 #   docker compose down -v             # stop + delete volumes
 # =============================================================================
 
@@ -63,6 +65,7 @@ services:
 
   # ---------------------------------------------------------------------------
   # Backend — Node.js / Express API
+  # Builds the codemaster-server:local image which is also reused by worker.
   # ---------------------------------------------------------------------------
   backend:
     build:
@@ -72,7 +75,7 @@ services:
     container_name: codemaster-backend
     restart: unless-stopped
     env_file:
-      - .env                    # root-level .env; overrides defaults below
+      - .env                    # root-level .env
     environment:
       NODE_ENV: production
       PORT: "5000"
@@ -85,6 +88,43 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:5000/ || exit 1"]
+      interval: 20s
+      timeout: 10s
+      start_period: 30s
+      retries: 3
+
+  # ---------------------------------------------------------------------------
+  # Worker — BullMQ submission job processor
+  #
+  # Shares the same codemaster-server:local image as backend.
+  # The only difference is the command: node worker.js instead of node server.js.
+  # No port exposed — purely an internal consumer.
+  #
+  # Scale horizontally with:  docker compose up --scale worker=3
+  # ---------------------------------------------------------------------------
+  worker:
+    image: codemaster-server:local   # reuses the image built by the backend service
+    container_name: codemaster-worker
+    restart: unless-stopped
+    command: ["dumb-init", "--", "node", "worker.js"]
+    env_file:
+      - .env
+    environment:
+      NODE_ENV: production
+    networks:
+      - codemaster-net
+    depends_on:
+      mongo:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      backend:                       # ensures the image is built (not that the API is healthy)
+        condition: service_started
+    # The worker is a BullMQ consumer, not an HTTP server — no HEALTHCHECK needed
+    healthcheck:
+      disable: true
 
   # ---------------------------------------------------------------------------
   # Frontend — React + Vite static SPA served by nginx
@@ -102,6 +142,12 @@ services:
       - codemaster-net
     depends_on:
       - backend
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO /dev/null http://127.0.0.1:80/health || exit 1"]
+      interval: 30s
+      timeout: 5s
+      start_period: 15s
+      retries: 3
 
 # =============================================================================
 # Named volumes — survive `docker compose down` (use -v to also delete them)
