@@ -22,7 +22,8 @@
  *  - Soft retry → a 10-second Redis blip doesn't take down the whole server.
  */
 
-const Redis = require('ioredis');
+const Redis  = require('ioredis');
+const logger = require('./logger');
 
 if (!process.env.REDIS_URL) {
     throw new Error(
@@ -42,29 +43,13 @@ const redisClient = new Redis(process.env.REDIS_URL, {
     lazyConnect: false,
 
     // Identify this client in Redis CLIENT LIST output for debugging.
-    connectionName: 'codemaster-rate-limit',
+    connectionName: 'codemaster-api',
 });
 
-redisClient.on('connect', () => {
-    console.log('[redis] Connected to Redis at', process.env.REDIS_URL);
-});
-
-redisClient.on('ready', () => {
-    console.log('[redis] Redis client ready — rate-limit stores active');
-});
-
-redisClient.on('error', (err) => {
-    // Log but do NOT call process.exit(). ioredis retries automatically.
-    // express-rate-limit will fall back to in-memory for the failing window.
-    console.error('[redis] Redis client error:', err.message);
-});
-
-redisClient.on('close', () => {
-    console.warn('[redis] Redis connection closed — retrying...');
-});
-
-redisClient.on('reconnecting', (delay) => {
-    console.warn(`[redis] Reconnecting in ${delay}ms...`);
-});
+redisClient.on('connect',      () => logger.info({ url: process.env.REDIS_URL }, 'Redis connected'));
+redisClient.on('ready',        () => logger.info('Redis client ready'));
+redisClient.on('error',        (err) => logger.error({ err }, 'Redis client error'));
+redisClient.on('close',        () => logger.warn('Redis connection closed — retrying...'));
+redisClient.on('reconnecting', (delay) => logger.warn({ delay }, 'Redis reconnecting'));
 
 module.exports = redisClient;

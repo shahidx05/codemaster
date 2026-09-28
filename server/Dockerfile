@@ -59,9 +59,10 @@ USER appuser
 # Expose the port the app listens on (default 5000, overridable via PORT env)
 EXPOSE 5000
 
-# HEALTHCHECK — hits the existing GET / route every 30 s.
+# HEALTHCHECK — hits the dedicated /health liveness endpoint added in Phase 7.
 # Starts after 15 s (lets server connect to MongoDB). Fails after 3 retries.
-HEALTHCHECK --interval=30s --timeout=10s --start-period=15s --retries=3 CMD wget -qO- http://localhost:5000/ | grep -q "CodeMaster API" || exit 1
+HEALTHCHECK --interval=30s --timeout=10s --start-period=15s --retries=3 \
+    CMD wget -qO- http://localhost:5000/health | grep -q '"status":"ok"' || exit 1
 
 # Secrets (MONGODB_URI, JWT_SECRET, etc.) must be supplied at runtime via
 # --env-file or -e flags. They are intentionally NOT set here.

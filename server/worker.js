@@ -5,41 +5,35 @@
  *
  * Standalone BullMQ Worker process for processing code submissions.
  *
- * Run as:  node server/worker.js   (in docker-compose: worker service)
+ * Run as:  node worker.js   (docker-compose: worker service)
  *
- * Responsibilities:
- *  1. Dequeue submission jobs from the 'submissions' BullMQ queue.
- *  2. Call codeExecutor.executeCode() with the job payload.
- *  3. Update the Submission document with real results.
- *  4. Update Problem counters (totalSubmissions, acceptedSubmissions, acceptanceRate).
- *  5. Update User.solvedProblems if the submission is Accepted.
- *  6. Invalidate the Redis problem-list cache (acceptanceRate changed).
- *  7. Invalidate the Redis leaderboard cache if it's a contest submission.
+ * Phase 7 additions:
+ *  - Pino structured logging — every log line carries jobId + submissionId
+ *  - Graceful shutdown on SIGTERM:
+ *      · worker.close() drains any active jobs (BullMQ waits for them to finish)
+ *      · Hard-kill timeout of WORKER_SHUTDOWN_TIMEOUT_MS (default 90s) prevents
+ *        an infinite hang if a Judge0 call never returns
+ *      · MongoDB and Redis are disconnected cleanly after draining
+ *  - Unhandled rejection / uncaught exception guards
  *
- * Retry semantics (critical design decision):
+ * Retry semantics (unchanged from Phase 6):
  * ─────────────────────────────────────────────────────────────────────────────
- * BullMQ retries a job when the processor function THROWS.
- * A processor that resolves (returns) is treated as success — no retry.
+ * The processor THROWS only on unexpected infrastructure errors (Judge0 down,
+ * network timeout, etc.) — these trigger BullMQ's 3-attempt exponential retry.
  *
- * We THROW only when codeExecutor itself throws an unexpected error
- * (e.g. Judge0 API is down, network timeout, unhandled exception).
- * In these cases, 3 attempts with exponential back-off (2s→4s→8s) fire.
+ * It RESOLVES on any valid judge result (Wrong Answer, Compilation Error, etc.)
+ * because those are correct, final results — retrying wouldn't change them.
  *
- * We do NOT throw — we resolve — when:
- *   - codeExecutor returns a result, even if status is Wrong Answer,
- *     Compilation Error, Runtime Error, Time/Memory Limit Exceeded.
- * These are semantically correct results from the judge. Retrying would
- * not change the outcome and would waste Judge0 API credits.
- *
- * After 3 failed attempts (all throwing), the failed-job event handler
- * marks the Submission document as 'Error' so it never stays in 'Queued'.
+ * After all retries are exhausted, the failed-job handler marks the Submission
+ * document as 'Error' so it never stays stuck in 'Queued' forever.
  */
 
-// Load .env before anything else (important: worker is its own process)
 require('dotenv').config();
 
 const mongoose     = require('mongoose');
 const { Worker }   = require('bullmq');
+
+const logger      = require('./config/logger');
 const { QUEUE_NAME, connection } = require('./queues/submissionQueue');
 const Submission   = require('./models/Submission');
 const Problem      = require('./models/Problem');
@@ -48,40 +42,48 @@ const codeExecutor = require('./utils/codeExecutor');
 const cache        = require('./utils/cache');
 
 // ── MongoDB connection ────────────────────────────────────────────────────────
-
 mongoose.connect(process.env.MONGODB_URI)
-    .then(() => console.log('[worker] MongoDB connected'))
-    .catch(err => { console.error('[worker] MongoDB connection error:', err.message); process.exit(1); });
+    .then(() => logger.info('MongoDB connected'))
+    .catch((err) => { logger.error({ err }, 'MongoDB connection failed'); process.exit(1); });
 
 // ── Job processor ─────────────────────────────────────────────────────────────
-
 async function processSubmission(job) {
     const { submissionId, problemId, code, language, contestId, userId } = job.data;
-    console.log(`[worker] Processing job ${job.id} — submission ${submissionId}`);
 
-    // Mark as Processing so the frontend can show an in-progress state
+    // Child logger bound to this job — every line automatically includes jobId + submissionId
+    const log = logger.child({ jobId: job.id, submissionId });
+
+    log.info({ problemId, language }, 'Job picked up');
+
+    // Mark as Processing so the frontend can show a progress state
     await Submission.findByIdAndUpdate(submissionId, { status: 'Processing' });
 
     // Fetch the full problem (needed for testCases + cppWrapper)
     const problem = await Problem.findById(problemId);
     if (!problem) {
-        // Problem was deleted between enqueue and processing — treat as error
+        log.warn('Problem not found — resolving without retry (problem was deleted)');
         await Submission.findByIdAndUpdate(submissionId, { status: 'Error' });
-        console.warn(`[worker] Problem ${problemId} not found for submission ${submissionId}`);
-        return; // Resolve (don't retry — the problem is genuinely gone)
+        return; // Resolve — retrying won't help if the problem is gone
     }
 
     // ── Call Judge0 via codeExecutor ──────────────────────────────────────────
-    // If this throws, BullMQ will retry (transient infrastructure failure).
-    // If it returns, we handle the result regardless of pass/fail — no retry.
+    // If this THROWS, BullMQ will retry (infrastructure failure).
+    // If it RETURNS, we handle the result regardless of pass/fail (no retry).
+    const t0 = Date.now();
     const executionResult = await codeExecutor.executeCode(
         code,
         problem.testCases,
         language,
         problem
     );
+    const execMs = Date.now() - t0;
 
     const isAccepted = executionResult.status === 'Accepted';
+
+    log.info(
+        { status: executionResult.status, execMs, isAccepted },
+        'Execution complete'
+    );
 
     // ── Update Submission document ────────────────────────────────────────────
     await Submission.findByIdAndUpdate(submissionId, {
@@ -99,7 +101,7 @@ async function processSubmission(job) {
         },
     });
 
-    // Recalculate acceptance rate
+    // Recalculate acceptanceRate
     const updated = await Problem.findById(problemId).select('totalSubmissions acceptedSubmissions');
     if (updated && updated.totalSubmissions > 0) {
         await Problem.findByIdAndUpdate(problemId, {
@@ -116,6 +118,7 @@ async function processSubmission(job) {
         await User.findByIdAndUpdate(userId, {
             $addToSet: { solvedProblems: problemId },
         });
+        log.info({ userId, problemId }, 'Problem marked as solved for user');
     }
 
     // ── Cache invalidation ────────────────────────────────────────────────────
@@ -125,58 +128,114 @@ async function processSubmission(job) {
     // Accepted contest submission → flush leaderboard cache
     if (contestId && isAccepted) {
         await cache.del(`contests:leaderboard:${contestId}`);
+        log.info({ contestId }, 'Leaderboard cache invalidated');
     }
 
-    console.log(`[worker] Job ${job.id} done — submission ${submissionId} status: ${executionResult.status}`);
+    log.info({ status: executionResult.status }, 'Job complete');
 }
 
 // ── Create worker ─────────────────────────────────────────────────────────────
-
 const worker = new Worker(QUEUE_NAME, processSubmission, {
     connection,
-    // Process one job at a time per worker instance.
-    // Scale horizontally by running more worker containers.
+    // concurrency: 2 — process up to 2 jobs simultaneously per worker instance.
+    // Scale horizontally via `docker compose up --scale worker=N` for more throughput.
     concurrency: 2,
 });
 
 worker.on('completed', (job) => {
-    console.log(`[worker] Job ${job.id} completed`);
+    logger.info({ jobId: job.id }, 'Job completed');
 });
 
 worker.on('failed', async (job, err) => {
-    console.error(`[worker] Job ${job.id} failed (attempt ${job.attemptsMade}/${job.opts.attempts}):`, err.message);
+    const log = logger.child({ jobId: job.id, submissionId: job.data?.submissionId });
+    log.error(
+        { err, attemptsMade: job.attemptsMade, maxAttempts: job.opts.attempts },
+        'Job failed'
+    );
 
-    // After all retries are exhausted, mark the submission as Error
-    // so it never stays stuck in 'Queued' or 'Processing' forever.
+    // After all retries exhausted, mark submission as Error so it never
+    // gets stuck in 'Queued' or 'Processing' permanently.
     if (job.attemptsMade >= (job.opts.attempts || 3)) {
         const submissionId = job.data?.submissionId;
         if (submissionId) {
             try {
                 await Submission.findByIdAndUpdate(submissionId, { status: 'Error' });
-                console.error(`[worker] Marked submission ${submissionId} as Error after ${job.attemptsMade} failed attempts`);
+                log.error('Marked submission as Error after exhausting all retries');
             } catch (updateErr) {
-                console.error('[worker] Could not mark submission as Error:', updateErr.message);
+                log.error({ err: updateErr }, 'Could not mark submission as Error');
             }
         }
     }
 });
 
 worker.on('error', (err) => {
-    console.error('[worker] Worker error:', err.message);
+    logger.error({ err }, 'Worker internal error');
 });
 
-console.log(`[worker] Listening on queue "${QUEUE_NAME}" (concurrency: 2)`);
+logger.info({ queue: QUEUE_NAME, concurrency: 2 }, 'Worker started');
 
-// Graceful shutdown
-process.on('SIGTERM', async () => {
-    console.log('[worker] SIGTERM received — closing worker gracefully...');
-    await worker.close();
-    await mongoose.disconnect();
+// ── Graceful shutdown ─────────────────────────────────────────────────────────
+//
+// On SIGTERM (Docker stop / K8s rolling update):
+//   1. worker.close() tells BullMQ to:
+//      a. Stop picking up new jobs from the queue.
+//      b. Wait for any currently-executing jobs to finish naturally.
+//      This means a job that's mid-Judge0-call will run to completion before
+//      the process exits — it won't be silently dropped.
+//   2. After draining, disconnect Mongo and Redis cleanly.
+//   3. A hard-kill timeout (default 90s) prevents hanging forever if a
+//      Judge0 call stalls (e.g. a stuck infinite loop submission).
+//
+// WHY 90s (not 30s like the API server)?
+//   A code execution job can take up to ~30s per test case × multiple cases.
+//   We allow up to 90s to let the current job batch complete. If it still
+//   hasn't finished, the job will be retried by another worker on restart.
+
+const SHUTDOWN_TIMEOUT_MS = parseInt(process.env.WORKER_SHUTDOWN_TIMEOUT_MS || '90000', 10);
+let isShuttingDown = false;
+
+async function shutdown(signal) {
+    if (isShuttingDown) return;
+    isShuttingDown = true;
+    logger.info({ signal }, 'Shutdown signal received — waiting for in-flight jobs to complete');
+
+    // Hard-kill safety net
+    const forceExit = setTimeout(() => {
+        logger.error({ timeoutMs: SHUTDOWN_TIMEOUT_MS }, 'Graceful shutdown timed out — forcing exit');
+        process.exit(1);
+    }, SHUTDOWN_TIMEOUT_MS);
+    forceExit.unref();
+
+    try {
+        // worker.close() blocks until all active jobs finish (or forcibly drains after timeout)
+        await worker.close();
+        logger.info('Worker drained — all in-flight jobs completed');
+
+        await mongoose.disconnect();
+        logger.info('MongoDB disconnected');
+
+        // Note: the shared ioredis connection from submissionQueue.js is managed
+        // by BullMQ internally; it will be closed when the worker closes.
+        logger.info('Redis connections closed via BullMQ worker teardown');
+    } catch (err) {
+        logger.error({ err }, 'Error during shutdown teardown');
+    }
+
+    clearTimeout(forceExit);
+    logger.info('Worker shutdown complete');
     process.exit(0);
+}
+
+process.on('SIGTERM', () => shutdown('SIGTERM'));
+process.on('SIGINT',  () => shutdown('SIGINT'));
+
+// ── Unhandled error guards ────────────────────────────────────────────────────
+process.on('unhandledRejection', (reason) => {
+    logger.error({ reason }, 'Unhandled promise rejection in worker — initiating shutdown');
+    shutdown('unhandledRejection');
 });
 
-process.on('SIGINT', async () => {
-    await worker.close();
-    await mongoose.disconnect();
-    process.exit(0);
+process.on('uncaughtException', (err) => {
+    logger.error({ err }, 'Uncaught exception in worker — exiting immediately');
+    process.exit(1);
 });
