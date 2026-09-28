@@ -2,6 +2,7 @@ const Submission = require('../models/Submission');
 const Problem    = require('../models/Problem');
 const User       = require('../models/User');
 const codeExecutor = require('../utils/codeExecutor');
+const cache      = require('../utils/cache');
 
 /**
  * Strip input/expectedOutput/actualOutput from private test case results.
@@ -107,6 +108,19 @@ exports.submitCode = async (req, res) => {
                 $addToSet: { solvedProblems: problemId }
             });
         }
+
+        // ── Cache invalidation ────────────────────────────────────────────────
+        // 1. acceptanceRate changed → flush problem list cache so the next
+        //    GET /api/problems serves updated rates, not stale ones.
+        await cache.delPattern('problems:list:*');
+
+        // 2. An accepted contest submission changes leaderboard standings.
+        //    Flush the cached leaderboard for this contest so the next reader
+        //    gets a fresh aggregation instead of stale results.
+        if (contestId && isAccepted) {
+            await cache.del(`contests:leaderboard:${contestId}`);
+        }
+        // ─────────────────────────────────────────────────────────────────────
 
         // Return masked results to the client
         const maskedResults = maskPrivateResults(executionResult.testResults);

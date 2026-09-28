@@ -1,6 +1,14 @@
+'use strict';
+
 const Contest    = require('../models/Contest');
 const Submission = require('../models/Submission');
 const Problem    = require('../models/Problem');
+const cache      = require('../utils/cache');
+
+// Cache TTL for contest leaderboards (seconds).
+// Short enough that active-contest viewers see near-real-time standings;
+// long enough to absorb bursts of concurrent readers during a contest.
+const LEADERBOARD_TTL = 20;
 
 // ── Helper ────────────────────────────────────────────────────────────────────
 
@@ -170,6 +178,9 @@ exports.updateContest = async (req, res) => {
             .populate('createdBy', 'username')
             .populate('problems.problem', 'title difficulty');
 
+        // Contest metadata changed — stale leaderboard could show wrong point values
+        await cache.del(`contests:leaderboard:${req.params.id}`);
+
         res.json({ message: 'Contest updated successfully', contest: updated });
     } catch (error) {
         res.status(500).json({ message: 'Server error', error: error.message });
@@ -190,6 +201,8 @@ exports.deleteContest = async (req, res) => {
         }
 
         await contest.deleteOne();
+        // Deleted contest — remove cached leaderboard
+        await cache.del(`contests:leaderboard:${req.params.id}`);
         res.json({ message: 'Contest deleted successfully' });
     } catch (error) {
         res.status(500).json({ message: 'Server error', error: error.message });
@@ -224,7 +237,19 @@ exports.joinContest = async (req, res) => {
 };
 
 // ── GET /api/contests/:id/leaderboard ────────────────────────────────────────
-// Authenticated: available after contest ends, OR for the contest owner / admin during active
+// Authenticated: available after contest ends, OR for the contest owner / admin during active.
+//
+// WHY CACHE THIS:
+//   Computing the leaderboard requires:
+//     1. A full Submission.find() scan filtered by contest + status
+//     2. A .populate('user', ...) joining the users collection
+//     3. An in-memory aggregation + sort across all accepted submissions
+//   Under load (many simultaneous viewers at contest end), this query fires on
+//   every request. A 20s cache absorbs the burst while keeping standings fresh.
+//
+// WHAT IS NOT CACHED:
+//   - Access control (role/ownership checks) — always runs live per request
+//   - User-specific data (getSubmissions, per-user results) — never cached here
 exports.getLeaderboard = async (req, res) => {
     try {
         const contest = await Contest.findById(req.params.id)
@@ -235,7 +260,7 @@ exports.getLeaderboard = async (req, res) => {
         const status  = computeStatus(contest);
         const isOwner = req.userId && contest.createdBy.toString() === req.userId;
 
-        // Fetch user's role for admin check
+        // Fetch user's role for admin check — always live, never cached
         let isAdmin = false;
         if (req.userId) {
             const User = require('../models/User');
@@ -250,68 +275,76 @@ exports.getLeaderboard = async (req, res) => {
             });
         }
 
-        // Build a map: problemId → points
-        const pointsMap = {};
-        for (const cp of contest.problems) {
-            pointsMap[cp.problem._id.toString()] = cp.points;
-        }
+        const cacheKey = `contests:leaderboard:${req.params.id}`;
 
-        // Fetch all Accepted submissions for this contest, oldest first
-        const submissions = await Submission.find({
-            contest: contest._id,
-            status:  'Accepted'
-        })
-            .populate('user', 'username profilePicture')
-            .sort({ createdAt: 1 });
-
-        // Aggregate: per user, first accepted submission per problem
-        const board = {};  // { userId: { user, totalPoints, solvedSet, lastTime } }
-
-        for (const sub of submissions) {
-            if (!sub.user || !sub.problem) continue;
-
-            const uid = sub.user._id.toString();
-            const pid = sub.problem.toString();
-
-            if (!board[uid]) {
-                board[uid] = {
-                    user:        sub.user,
-                    totalPoints: 0,
-                    solvedSet:   new Set(),
-                    lastTime:    sub.createdAt
-                };
+        // The expensive aggregation — only called on cache MISS
+        const buildLeaderboard = async () => {
+            // Build a map: problemId → points
+            const pointsMap = {};
+            for (const cp of contest.problems) {
+                pointsMap[cp.problem._id.toString()] = cp.points;
             }
 
-            // All-or-nothing: only first accepted submission per problem counts
-            if (!board[uid].solvedSet.has(pid)) {
-                board[uid].solvedSet.add(pid);
-                board[uid].totalPoints += (pointsMap[pid] || 0);
-                board[uid].lastTime = sub.createdAt;
-            }
-        }
-
-        // Sort: most points first; ties broken by earlier last submission time
-        const ranked = Object.values(board)
-            .sort((a, b) => {
-                if (b.totalPoints !== a.totalPoints) return b.totalPoints - a.totalPoints;
-                return new Date(a.lastTime) - new Date(b.lastTime);
+            // Fetch all Accepted submissions for this contest, oldest first
+            const submissions = await Submission.find({
+                contest: contest._id,
+                status:  'Accepted'
             })
-            .map((entry, idx) => ({
-                rank:           idx + 1,
-                user:           {
-                    id:             entry.user._id,
-                    username:       entry.user.username,
-                    profilePicture: entry.user.profilePicture
-                },
-                totalPoints:    entry.totalPoints,
-                problemsSolved: entry.solvedSet.size,
-                lastSubmission: entry.lastTime
-            }));
+                .populate('user', 'username profilePicture')
+                .sort({ createdAt: 1 });
 
-        res.json({
-            contest: { title: contest.title, endTime: contest.endTime },
-            leaderboard: ranked
-        });
+            // Aggregate: per user, first accepted submission per problem
+            const board = {};  // { userId: { user, totalPoints, solvedSet, lastTime } }
+
+            for (const sub of submissions) {
+                if (!sub.user || !sub.problem) continue;
+
+                const uid = sub.user._id.toString();
+                const pid = sub.problem.toString();
+
+                if (!board[uid]) {
+                    board[uid] = {
+                        user:        sub.user,
+                        totalPoints: 0,
+                        solvedSet:   new Set(),
+                        lastTime:    sub.createdAt
+                    };
+                }
+
+                // All-or-nothing: only first accepted submission per problem counts
+                if (!board[uid].solvedSet.has(pid)) {
+                    board[uid].solvedSet.add(pid);
+                    board[uid].totalPoints += (pointsMap[pid] || 0);
+                    board[uid].lastTime = sub.createdAt;
+                }
+            }
+
+            // Sort: most points first; ties broken by earlier last submission time
+            const ranked = Object.values(board)
+                .sort((a, b) => {
+                    if (b.totalPoints !== a.totalPoints) return b.totalPoints - a.totalPoints;
+                    return new Date(a.lastTime) - new Date(b.lastTime);
+                })
+                .map((entry, idx) => ({
+                    rank:           idx + 1,
+                    user:           {
+                        id:             entry.user._id,
+                        username:       entry.user.username,
+                        profilePicture: entry.user.profilePicture
+                    },
+                    totalPoints:    entry.totalPoints,
+                    problemsSolved: entry.solvedSet.size,
+                    lastSubmission: entry.lastTime
+                }));
+
+            return {
+                contest: { title: contest.title, endTime: contest.endTime },
+                leaderboard: ranked
+            };
+        };
+
+        const payload = await cache.getOrSet(cacheKey, LEADERBOARD_TTL, buildLeaderboard);
+        res.json(payload);
     } catch (error) {
         console.error('Leaderboard error:', error);
         res.status(500).json({ message: 'Server error', error: error.message });
