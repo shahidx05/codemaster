@@ -1,19 +1,29 @@
 # =============================================================================
-# docker-compose.yml — Full-stack local development orchestration
+# docker-compose.yml — Full-stack orchestration with horizontal backend scaling
 #
 # Services:
 #   mongo    — MongoDB 7 with data persistence & healthcheck
 #   redis    — Redis 7 Alpine with AOF persistence & healthcheck
-#   backend  — Node/Express API (builds from server/Dockerfile)
+#   backend  — Node/Express API (3 replicas, no host port — behind proxy)
+#   proxy    — nginx reverse proxy, load-balances across backend replicas
 #   worker   — BullMQ submission job processor (same image as backend)
-#   frontend — React/Vite SPA served by nginx (builds from client/Dockerfile)
+#   frontend — React/Vite SPA served by nginx (separate from proxy)
+#
+# Horizontal scaling:
+#   The backend service has NO container_name and NO fixed host port so it can
+#   be replicated. Only the 'proxy' service is exposed to the host on :5000.
+#
+#   To scale backend replicas:
+#     docker compose up -d --scale backend=3   (default in this file)
+#     docker compose up -d --scale backend=5   (burst)
 #
 # Usage:
-#   docker compose up --build          # first run / after code changes
-#   docker compose up -d               # detached (subsequent runs)
-#   docker compose logs -f backend     # follow the API server
-#   docker compose logs -f worker      # follow worker job processing
-#   docker compose down -v             # stop + delete volumes
+#   docker compose up --build                  # first run / after code changes
+#   docker compose up -d --scale backend=3     # run with 3 backend replicas
+#   docker compose logs -f proxy               # follow nginx access log
+#   docker compose logs -f backend             # follows ALL replica logs
+#   docker compose logs -f worker              # follow worker job processing
+#   docker compose down -v                     # stop + delete volumes
 # =============================================================================
 
 services:
@@ -65,22 +75,30 @@ services:
 
   # ---------------------------------------------------------------------------
   # Backend — Node.js / Express API
-  # Builds the codemaster-server:local image which is also reused by worker.
+  #
+  # NO container_name — required for docker compose --scale to work.
+  # NO host port mapping — replicas share an internal port; only the proxy
+  # is exposed to the host. This is intentional:
+  #   - Prevents port conflicts when scaling (you can't bind 5000:5000 × 3)
+  #   - Forces all traffic through the proxy (single ingress point)
+  #   - The proxy (below) exposes :5000 to the host for the load test
+  #
+  # Build the image once via the 'backend' service; the 'worker' service
+  # reuses the resulting codemaster-server:local image tag.
   # ---------------------------------------------------------------------------
   backend:
     build:
       context: ./server
       dockerfile: Dockerfile
     image: codemaster-server:local
-    container_name: codemaster-backend
     restart: unless-stopped
     env_file:
-      - .env                    # root-level .env
+      - .env
     environment:
       NODE_ENV: production
       PORT: "5000"
-    ports:
-      - "5000:5000"
+    expose:
+      - "5000"                  # visible to other containers but NOT the host
     networks:
       - codemaster-net
     depends_on:
@@ -94,6 +112,38 @@ services:
       timeout: 10s
       start_period: 30s
       retries: 3
+    deploy:
+      replicas: 3              # default replica count for `docker compose up`
+
+  # ---------------------------------------------------------------------------
+  # Proxy — nginx reverse proxy & load balancer
+  #
+  # This is the ONLY service with a host port binding on :5000.
+  # It distributes incoming requests across all backend replicas using Docker's
+  # internal DNS (127.0.0.11) with per-request re-resolution (valid=10s).
+  #
+  # Access the API at:   http://localhost:5000
+  # nginx access logs:   docker compose logs -f proxy
+  # ---------------------------------------------------------------------------
+  proxy:
+    image: nginx:1.27.5-alpine3.21
+    container_name: codemaster-proxy
+    restart: unless-stopped
+    ports:
+      - "5000:80"               # :5000 on host → nginx → backend replicas
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+    networks:
+      - codemaster-net
+    depends_on:
+      backend:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:80/nginx-health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      start_period: 10s
+      retries: 3
 
   # ---------------------------------------------------------------------------
   # Worker — BullMQ submission job processor
@@ -102,10 +152,10 @@ services:
   # The only difference is the command: node worker.js instead of node server.js.
   # No port exposed — purely an internal consumer.
   #
-  # Scale horizontally with:  docker compose up --scale worker=3
+  # Scale horizontally: docker compose up -d --scale worker=3
   # ---------------------------------------------------------------------------
   worker:
-    image: codemaster-server:local   # reuses the image built by the backend service
+    image: codemaster-server:local
     container_name: codemaster-worker
     restart: unless-stopped
     command: ["dumb-init", "--", "node", "worker.js"]
@@ -120,9 +170,8 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
-      backend:                       # ensures the image is built (not that the API is healthy)
+      backend:
         condition: service_started
-    # The worker is a BullMQ consumer, not an HTTP server — no HEALTHCHECK needed
     healthcheck:
       disable: true
 
@@ -141,7 +190,7 @@ services:
     networks:
       - codemaster-net
     depends_on:
-      - backend
+      - proxy
     healthcheck:
       test: ["CMD-SHELL", "wget -qO /dev/null http://127.0.0.1:80/health || exit 1"]
       interval: 30s
@@ -159,7 +208,7 @@ volumes:
     driver: local
 
 # =============================================================================
-# Custom bridge network — all services can reach each other by service name
+# Custom bridge network — all services reach each other by service name
 # =============================================================================
 networks:
   codemaster-net:
