@@ -112,6 +112,9 @@ services:
       timeout: 10s
       start_period: 30s
       retries: 3
+    # Docker sends SIGTERM then waits stop_grace_period before SIGKILL.
+    # 35 s gives the Node process its full 30 s SHUTDOWN_TIMEOUT_MS to drain.
+    stop_grace_period: 35s
     deploy:
       replicas: 3              # default replica count for `docker compose up`
 
@@ -148,15 +151,14 @@ services:
   # ---------------------------------------------------------------------------
   # Worker — BullMQ submission job processor
   #
+  # NO container_name — required for docker compose --scale worker=N.
   # Shares the same codemaster-server:local image as backend.
-  # The only difference is the command: node worker.js instead of node server.js.
   # No port exposed — purely an internal consumer.
   #
   # Scale horizontally: docker compose up -d --scale worker=3
   # ---------------------------------------------------------------------------
   worker:
     image: codemaster-server:local
-    container_name: codemaster-worker
     restart: unless-stopped
     command: ["dumb-init", "--", "node", "worker.js"]
     env_file:
@@ -172,6 +174,10 @@ services:
         condition: service_healthy
       backend:
         condition: service_started
+    # Docker sends SIGTERM then waits stop_grace_period before SIGKILL.
+    # 100 s gives the worker its full WORKER_SHUTDOWN_TIMEOUT_MS (90 s) to drain
+    # any in-flight job (Judge0 submissions can take up to ~30 s per test case).
+    stop_grace_period: 100s
     healthcheck:
       disable: true
 
