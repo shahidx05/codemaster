@@ -60,10 +60,14 @@ const TERMINAL_STATUSES = new Set([
 /**
  * pollUntilDone(submissionId, onUpdate, options)
  *
- * Polls GET /submissions/:id/status every `intervalMs` ms until:
+ * Polls GET /submissions/:id/status with gentle exponential backoff until:
  *   - The submission reaches a terminal status  → resolves with the full result
  *   - `timeoutMs` has elapsed                   → rejects with a timeout error
  *   - `signal` is aborted (e.g. component unmount) → rejects with AbortError
+ *
+ * Backoff: starts at `intervalMs` (default 1.5 s), doubles each attempt up to
+ * `maxIntervalMs` (default 8 s). This is gentle enough to not miss a fast result
+ * but cuts request volume roughly in half for submissions that take >10 s.
  *
  * onUpdate(status) is called on every poll so the UI can show 'Queued' vs
  * 'Processing' transitions while waiting.
@@ -71,9 +75,10 @@ const TERMINAL_STATUSES = new Set([
 export async function pollUntilDone(
     submissionId,
     onUpdate = () => {},
-    { intervalMs = 1500, timeoutMs = 120_000, signal } = {}
+    { intervalMs = 1500, maxIntervalMs = 8000, timeoutMs = 120_000, signal } = {}
 ) {
     const deadline = Date.now() + timeoutMs
+    let currentInterval = intervalMs
 
     while (true) {
         if (signal?.aborted) {
@@ -90,11 +95,12 @@ export async function pollUntilDone(
             return data // { submissionId, status, isTerminal: true, submission: {...} }
         }
 
-        // Wait before next poll
+        // Exponential backoff — doubles each poll, capped at maxIntervalMs
         await new Promise((resolve, reject) => {
-            const t = setTimeout(resolve, intervalMs)
+            const t = setTimeout(resolve, currentInterval)
             signal?.addEventListener('abort', () => { clearTimeout(t); reject(new DOMException('Polling aborted', 'AbortError')) }, { once: true })
         })
+        currentInterval = Math.min(currentInterval * 2, maxIntervalMs)
     }
 }
 
