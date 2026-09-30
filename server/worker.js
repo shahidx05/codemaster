@@ -30,6 +30,7 @@
 
 require('dotenv').config();
 
+const os           = require('os');
 const mongoose     = require('mongoose');
 const { Worker }   = require('bullmq');
 
@@ -41,19 +42,35 @@ const User         = require('./models/User');
 const codeExecutor = require('./utils/codeExecutor');
 const cache        = require('./utils/cache');
 
+// Container hostname — identifies which worker replica handled a given job.
+// Logged on every line so `docker compose logs worker` shows per-replica attribution.
+const WORKER_HOSTNAME = os.hostname();
+
 // ── MongoDB connection ────────────────────────────────────────────────────────
 mongoose.connect(process.env.MONGODB_URI)
-    .then(() => logger.info('MongoDB connected'))
+    .then(() => logger.info({ workerHostname: WORKER_HOSTNAME }, 'MongoDB connected'))
     .catch((err) => { logger.error({ err }, 'MongoDB connection failed'); process.exit(1); });
+
+// Artificial delay for SIGTERM mid-job drain test (item 6).
+// Set JOB_ARTIFICIAL_DELAY_MS in environment to a non-zero value only during testing.
+// Must be 0 (default) in production.
+const ARTIFICIAL_DELAY_MS = parseInt(process.env.JOB_ARTIFICIAL_DELAY_MS || '0', 10);
 
 // ── Job processor ─────────────────────────────────────────────────────────────
 async function processSubmission(job) {
     const { submissionId, problemId, code, language, contestId, userId } = job.data;
 
-    // Child logger bound to this job — every line automatically includes jobId + submissionId
-    const log = logger.child({ jobId: job.id, submissionId });
+    // Child logger bound to this job — every line includes jobId, submissionId,
+    // and workerHostname so scaled workers can be attributed per job.
+    const log = logger.child({ jobId: job.id, submissionId, workerHostname: WORKER_HOSTNAME });
 
     log.info({ problemId, language }, 'Job picked up');
+
+    // Artificial delay — only active when JOB_ARTIFICIAL_DELAY_MS > 0 (test only).
+    if (ARTIFICIAL_DELAY_MS > 0) {
+        log.warn({ delayMs: ARTIFICIAL_DELAY_MS }, 'Artificial delay active (test mode)');
+        await new Promise(r => setTimeout(r, ARTIFICIAL_DELAY_MS));
+    }
 
     // Mark as Processing so the frontend can show a progress state
     await Submission.findByIdAndUpdate(submissionId, { status: 'Processing' });
