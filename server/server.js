@@ -26,7 +26,7 @@ const { RedisStore } = require('rate-limit-redis');
 const pinoHttp       = require('pino-http');
 
 const logger      = require('./config/logger');
-const redisClient = require('./config/redis');
+const { redisClient, waitForRedisReady } = require('./config/redis');
 const requestId   = require('./middleware/requestId');
 
 const authRoutes       = require('./routes/auth');
@@ -34,11 +34,23 @@ const problemRoutes    = require('./routes/problems');
 const submissionRoutes = require('./routes/submissions');
 const contestRoutes    = require('./routes/contests');
 
+const os = require('os');
+
 // ── App setup ─────────────────────────────────────────────────────────────────
 const app = express();
 
+// Trust the nginx reverse proxy sitting directly in front of us (hop count = 1).
+// Without this, req.ip is always the proxy container's IP, not the real client IP,
+// which means ALL requests share the same rate-limit bucket (the proxy's IP).
+// With trust proxy=1, Express reads the real IP from X-Forwarded-For[0].
+app.set('trust proxy', 1);
+
 // 1. Correlation-ID first — every downstream middleware gets req.log
 app.use(requestId);
+
+// X-Served-By: container hostname — proves which replica handled a request.
+// Used for load-balancing verification (item 8 of the hardening pass).
+app.use((req, res, next) => { res.setHeader('X-Served-By', os.hostname()); next(); });
 
 // 2. pino-http request/response logging
 //    Reuses req.log (already bound to requestId) so log lines are correlated.
@@ -85,37 +97,21 @@ app.use(cors({
 app.use(express.json({ limit: '10kb' }));
 
 // ── Rate limiters ─────────────────────────────────────────────────────────────
-// Backed by shared Redis — restart-resilient and replica-consistent.
-
-const globalLimiter = rateLimit({
-    windowMs: 15 * 60 * 1000,
-    max: 100,
-    standardHeaders: true,
-    legacyHeaders: false,
-    message: { message: 'Too many requests, please try again later.' },
-    store: new RedisStore({
-        sendCommand: (...args) => redisClient.call(...args),
-        prefix: 'rl:global:',
-    }),
-});
-
-// Submission limiter: 10/min for actual POSTs only.
-// GET /status polling is intentionally excluded so polling doesn't burn the quota.
-const submissionLimiter = rateLimit({
-    windowMs: 60 * 1000,
-    max: 10,
-    message: { message: 'Too many submissions. Please wait before submitting again.' },
-    store: new RedisStore({
-        sendCommand: (...args) => redisClient.call(...args),
-        prefix: 'rl:submissions:',
-    }),
-});
-
-app.use(globalLimiter);
-app.use('/api/submissions', (req, res, next) => {
-    if (req.method === 'POST') return submissionLimiter(req, res, next);
-    next();
-});
+// All three limiters are backed by the shared Redis instance.
+//
+// passOnStoreError: true
+//   When Redis is unavailable the limiter fails OPEN (allows the request through)
+//   and logs a warning. This is the correct choice for a best-effort API:
+//   a Redis blip should not take down the whole service, but it MUST be logged
+//   visibly so the operator knows rate-limiting is degraded.
+//
+//   The alternative — fail CLOSED — would make the API return 500s or hang any
+//   time Redis is unreachable, which is worse than degraded rate-limiting.
+//
+// NOTE: The old comment about "in-memory fallback" was misleading. There is no
+// automatic in-memory fallback. With passOnStoreError: true the limiter simply
+// skips counting for that request. With passOnStoreError: false (the default)
+// it returns a 500. Neither falls back to an in-memory counter.
 
 // ── MongoDB connection ────────────────────────────────────────────────────────
 mongoose.connect(process.env.MONGODB_URI)
@@ -128,6 +124,8 @@ mongoose.connect(process.env.MONGODB_URI)
 app.get('/health', (req, res) => {
     res.json({ status: 'ok', uptime: process.uptime() });
 });
+
+
 
 // ── Readiness probe ───────────────────────────────────────────────────────────
 // Returns 200 only when the process can actually serve traffic:
@@ -164,33 +162,90 @@ app.get('/ready', async (req, res) => {
     });
 });
 
-// ── Application routes ────────────────────────────────────────────────────────
-app.get('/', (req, res) => {
-    res.json({ message: 'CodeMaster API is running.' });
-});
+let server;
 
-app.use('/api/auth',        authRoutes);
-app.use('/api/problems',    problemRoutes);
-app.use('/api/submissions', submissionRoutes);
-app.use('/api/contests',    contestRoutes);
+async function startServer() {
+    try {
+        await waitForRedisReady(30000);
+        logger.info('Redis is ready, initializing limiters...');
+    } catch (err) {
+        logger.fatal({ err }, 'Redis failed to become ready at startup. Exiting.');
+        process.exit(1);
+    }
 
-// ── Global error handler ──────────────────────────────────────────────────────
-// Catches errors passed via next(err) from routes/middleware.
-// Always includes the correlation ID so the client can report it.
-app.use((err, req, res, next) => {  // eslint-disable-line no-unused-vars
-    const log = req.log || logger;
-    log.error({ err, requestId: req.requestId }, 'Unhandled route error');
-    res.status(err.status || 500).json({
-        message: err.expose ? err.message : 'Internal server error',
-        requestId: req.requestId,  // client can quote this when reporting bugs
+    // Global limiter: 100 req / 15 min per real client IP.
+    // Exempt: /health, /ready (orchestrator probes), /api/submissions/:id/status (polling).
+    const globalLimiter = rateLimit({
+        windowMs: 15 * 60 * 1000,
+        max: 100,
+        standardHeaders: true,
+        legacyHeaders: false,
+        message: { message: 'Too many requests, please try again later.' },
+        passOnStoreError: true,  // fail-open on Redis outage, log warning below
+        store: new RedisStore({
+            sendCommand: (...args) => redisClient.call(...args),
+            prefix: 'rl:global:',
+        }),
+        skip: (req) => {
+            // Skip probes — orchestrators poll these at high frequency
+            if (req.path === '/health' || req.path === '/ready') return true;
+            // Skip status polling — users legitimately poll every 1.5 s while waiting
+            // for a submission result. Burning the global quota on probes would block
+            // legitimate API calls.
+            if (req.method === 'GET' && req.path.match(/^\/api\/submissions\/[^/]+\/status$/)) return true;
+            return false;
+        },
     });
-});
 
-// ── Server startup ────────────────────────────────────────────────────────────
-const PORT = process.env.PORT || 5000;
-const server = app.listen(PORT, () => {
-    logger.info({ port: PORT }, 'Server listening');
-});
+    // Submission limiter: 10 actual code submissions / min per IP.
+    // Applied only to POST /api/submissions — not to GET polling.
+    const submissionLimiter = rateLimit({
+        windowMs: 60 * 1000,
+        max: 10,
+        message: { message: 'Too many submissions. Please wait before submitting again.' },
+        passOnStoreError: true,  // fail-open — same reasoning as globalLimiter
+        store: new RedisStore({
+            sendCommand: (...args) => redisClient.call(...args),
+            prefix: 'rl:submissions:',
+        }),
+    });
+
+    app.use(globalLimiter);
+    app.use('/api/submissions', (req, res, next) => {
+        if (req.method === 'POST') return submissionLimiter(req, res, next);
+        next();
+    });
+
+    // ── Application routes ────────────────────────────────────────────────────────
+    app.get('/', (req, res) => {
+        res.json({ message: 'CodeMaster API is running.' });
+    });
+
+    app.use('/api/auth',        authRoutes);
+    app.use('/api/problems',    problemRoutes);
+    app.use('/api/submissions', submissionRoutes);
+    app.use('/api/contests',    contestRoutes);
+
+    // ── Global error handler ──────────────────────────────────────────────────────
+    // Catches errors passed via next(err) from routes/middleware.
+    // Always includes the correlation ID so the client can report it.
+    app.use((err, req, res, next) => {  // eslint-disable-line no-unused-vars
+        const log = req.log || logger;
+        log.error({ err, requestId: req.requestId }, 'Unhandled route error');
+        res.status(err.status || 500).json({
+            message: err.expose ? err.message : 'Internal server error',
+            requestId: req.requestId,  // client can quote this when reporting bugs
+        });
+    });
+
+    // ── Server startup ────────────────────────────────────────────────────────────
+    const PORT = process.env.PORT || 5000;
+    server = app.listen(PORT, () => {
+        logger.info({ port: PORT }, 'Server listening');
+    });
+}
+
+startServer();
 
 // ── Graceful shutdown ─────────────────────────────────────────────────────────
 //
@@ -218,8 +273,7 @@ async function shutdown(signal) {
     }, SHUTDOWN_TIMEOUT_MS);
     forceExit.unref(); // Don't keep the event loop alive just for this timer
 
-    // Stop accepting new connections; wait for existing ones to finish
-    server.close(async () => {
+    const teardown = async () => {
         logger.info('HTTP server closed — no new connections accepted');
         try {
             await mongoose.disconnect();
@@ -232,7 +286,14 @@ async function shutdown(signal) {
         clearTimeout(forceExit);
         logger.info('Graceful shutdown complete');
         process.exit(0);
-    });
+    };
+
+    if (server) {
+        // Stop accepting new connections; wait for existing ones to finish
+        server.close(teardown);
+    } else {
+        await teardown();
+    }
 }
 
 process.on('SIGTERM', () => shutdown('SIGTERM'));

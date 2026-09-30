@@ -7,19 +7,19 @@
  * ─────────────────────────────────────────────────────────────────────
  * We treat Redis as a required infrastructure dependency for rate limiting.
  * If REDIS_URL is missing entirely, we throw immediately at startup so the
- * problem is visible in container logs rather than silently falling back to
- * in-memory counters (which would defeat the whole purpose of this change).
+ * problem is visible in container logs.
  *
- * However, *after* the initial connection succeeds, transient Redis errors
- * (network blip, brief restart) are logged and ioredis retries automatically
- * via its built-in exponential back-off. We do NOT exit the process for these
- * because express-rate-limit's RedisStore will fall back to its built-in
- * in-memory store on any single failed command, meaning the API stays up with
- * degraded (but still functional) rate limiting during short outages.
+ * However, *after* the initial connection succeeds, if Redis goes down, we
+ * want the API to continue serving requests rather than hanging indefinitely.
+ * We configure the client to bound the worst-case wait using commandTimeout and
+ * maxRetriesPerRequest, ensuring rate limiters fail-open immediately via
+ * `passOnStoreError` instead of piling up pending requests and causing the app to hang.
+ * We leave enableOfflineQueue as true (the default) so that critical startup
+ * commands (like RedisStore.init) can queue briefly and recover if Redis comes back.
  *
  * This is the right trade-off for a web API:
- *  - Hard fail → clear, early signal that config is wrong.
- *  - Soft retry → a 10-second Redis blip doesn't take down the whole server.
+ *  - Hard fail on missing config → clear, early signal.
+ *  - Fail-fast on runtime commands → Redis blips don't take down the server.
  */
 
 const Redis  = require('ioredis');
@@ -33,10 +33,16 @@ if (!process.env.REDIS_URL) {
 }
 
 const redisClient = new Redis(process.env.REDIS_URL, {
-    // ioredis will retry failed connections with exponential back-off.
-    // maxRetriesPerRequest: null makes commands queue until reconnected
-    // rather than immediately failing — appropriate for rate-limit counters.
-    maxRetriesPerRequest: null,
+    // Instead of waiting infinitely, fail the command if retries are exhausted.
+    maxRetriesPerRequest: 1,
+
+    // Any command taking longer than 3 seconds will fail.
+    // Together with maxRetriesPerRequest: 1, this bounds the worst-case wait
+    // so no request can hang indefinitely during an outage.
+    // Note: We leave enableOfflineQueue as true (default) so that early startup
+    // commands (like RedisStore.init() SCRIPT LOAD) queue briefly and can succeed
+    // if Redis reconnects, preventing permanent fail-open bugs.
+    commandTimeout: 3000,
 
     // Log a clear error if the initial connection is refused, but don't crash
     // (ioredis will keep retrying; the 'error' event below handles logging).
@@ -52,4 +58,29 @@ redisClient.on('error',        (err) => logger.error({ err }, 'Redis client erro
 redisClient.on('close',        () => logger.warn('Redis connection closed — retrying...'));
 redisClient.on('reconnecting', (delay) => logger.warn({ delay }, 'Redis reconnecting'));
 
-module.exports = redisClient;
+/**
+ * Returns a Promise that resolves when the Redis client emits 'ready'.
+ * Rejects if the client doesn't become ready within timeoutMs.
+ */
+function waitForRedisReady(timeoutMs = 30000) {
+    if (redisClient.status === 'ready') return Promise.resolve();
+
+    return new Promise((resolve, reject) => {
+        const timeout = setTimeout(() => {
+            redisClient.removeListener('ready', onReady);
+            reject(new Error(`Redis failed to become ready within ${timeoutMs}ms`));
+        }, timeoutMs);
+
+        const onReady = () => {
+            clearTimeout(timeout);
+            resolve();
+        };
+
+        redisClient.once('ready', onReady);
+    });
+}
+
+module.exports = {
+    redisClient,
+    waitForRedisReady,
+};
