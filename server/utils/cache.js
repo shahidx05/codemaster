@@ -24,7 +24,7 @@
  * database so a Redis hiccup never surfaces as a 5xx to the client.
  */
 
-const redis = require('../config/redis');
+const { redisClient: redis } = require('../config/redis');
 
 /**
  * @param {string}   key          Redis key
